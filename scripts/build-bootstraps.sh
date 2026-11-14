@@ -371,6 +371,72 @@ create_bootstrap_archive() {
 				echo "    [!] MISSING or not executable: $f"
 			fi
 		done
+
+		# ------------------------------------------------------------------
+		# 在 $PREFIX/bin/ 下建符号链接指向 opt/ 里的真实脚本
+		#
+		# 为什么必须有：opt/ 里的东西不在 $PATH 上，直接敲 d2j-dex2jar /
+		# apksigner / Sources-AI-unpack 会 command not found。v3 的做法就是
+		# 在 bin/ 下建 24 个链接指向 ../opt/...，这些链接会在打包时被
+		# create_bootstrap_archive 收集进 SYMLINKS.txt —— 该函数用
+		# `find . -type l` 扫描全部链接，rm 掉实体并把 readlink 结果写进
+		# 清单。所以这里只需建真链接，不需要手写 SYMLINKS.txt。
+		#
+		# 目标用相对路径 ../opt/... 而不是绝对路径：bootstrap 的前缀在运行时
+		# 才确定（/data/data/<pkg>/files/usr），绝对路径会把自己写死。
+		# ------------------------------------------------------------------
+		local binpfx="${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}/bin"
+		mkdir -p "$binpfx"
+		local nlink=0
+
+		# 建单个链接。已有同名实体文件时跳过，避免覆盖 termux 自己装的命令。
+		__opt_link() {
+			local target="$1" link="$2"
+			local full="${binpfx}/${link}"
+			if [ -e "$full" ] && [ ! -L "$full" ]; then
+				echo "    [!] skip link $link: a real file already exists"
+				return 0
+			fi
+			rm -f "$full"
+			if ln -sf "$target" "$full"; then
+				nlink=$((nlink + 1))
+			fi
+		}
+
+		# Sources-AI-dexkit 的两个入口
+		__opt_link ../opt/Sources-AI-dexkit/bin/Sources-AI-unpack Sources-AI-unpack
+		__opt_link ../opt/Sources-AI-dexkit/bin/apksigner apksigner
+
+		# dex2jar 的启动器：同一个 dex-tools 提供 d2j-run 与 dex2jar 两个名字
+		__opt_link ../opt/dex2jar/bin/dex-tools d2j-run
+		__opt_link ../opt/dex2jar/bin/dex-tools dex2jar
+
+		# dex2jar 的 17 个 d2j-*.sh，链接名去掉 .sh 后缀
+		for shfile in "${destdir}/dex2jar"/d2j-*.sh; do
+			[ -e "$shfile" ] || continue
+			local base name
+			base="$(basename "$shfile")"
+			name="${base%.sh}"
+			__opt_link "../opt/dex2jar/${base}" "$name"
+		done
+
+		# d2j_invoke.sh 用的是下划线，不在上面的 d2j-*.sh 通配里，
+		# 但 v3 确实为它建了链接（d2j_invoke），补上以保持行为一致。
+		if [ -e "${destdir}/dex2jar/d2j_invoke.sh" ]; then
+			__opt_link ../opt/dex2jar/d2j_invoke.sh d2j_invoke
+		fi
+
+		echo "[*] opt symlinks created in bin/: $nlink"
+
+		# 自检：回读全局范围内所有指向 opt/ 的链接，打印出来核对
+		local back
+		back=$(find "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}" -type l 2>/dev/null |
+		       while IFS= read -r l; do
+		           case "$(readlink "$l")" in
+		               *opt/*) printf '%s\n' "$l" ;;
+		           esac
+		       done | wc -l)
+		echo "[*] links pointing into opt/ (will be written to SYMLINKS.txt): $back"
 	}
 
 	termux_bootstrap_install_opt
