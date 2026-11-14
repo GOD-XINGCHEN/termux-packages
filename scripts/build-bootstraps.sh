@@ -397,7 +397,7 @@ main() {
 		termux_step_handle_buildarch
 
 		if [[ $FORCE_BUILD_PACKAGES == "1" ]]; then
-			rm -f "$TERMUX_BUILT_PACKAGES_DIRECTORY_FOR_ARCH"/*
+			rm -f -- "${TERMUX_BUILT_PACKAGES_DIRECTORY_FOR_ARCH:?}/"*
 			rm -f "$TERMUX_BUILT_DEBS_DIRECTORY"/*
 		fi
 
@@ -429,7 +429,7 @@ main() {
 
 		# Core utilities.
 		PACKAGES+=("bash") # Used by `termux-bootstrap-second-stage.sh`
-		PACKAGES+=("bzip2")
+		PACKAGES+=("libbz2")
 		if ! ${BOOTSTRAP_ANDROID10_COMPATIBLE}; then
 			PACKAGES+=("command-not-found")
 		else
@@ -483,7 +483,7 @@ main() {
 		extract_debs "$TERMUX_ARCH" || return $?
 
 		# Add termux bootstrap second stage files
-		add_termux_bootstrap_second_stage_files "$package_arch"
+		add_termux_bootstrap_second_stage_files "$TERMUX_ARCH"
 
 		# Create bootstrap archive.
 		create_bootstrap_archive "$TERMUX_ARCH" || return $?
