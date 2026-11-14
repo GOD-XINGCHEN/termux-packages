@@ -39,10 +39,10 @@ on:
         required: false
         default: ""
       force_rebuild:
-        description: "强制重编（-f）。全新 runner 无缓存时不需要"
+        description: "强制重编（-f）。**必须保持 true**：换过包名后，旧 deb 缓存里的 ELF 仍烧着 com.termux 前缀，复用会产出「有残留」的坏 bootstrap；增包时依赖 deb 前缀不一致还会让 configure 直接失败"
         required: false
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: read
@@ -111,6 +111,43 @@ jobs:
       # 前置校验：build-bootstraps.sh 里的每个字面量包名都要能解析到源码目录
       #   （该脚本曾写 bzip2 / curl / xz-utils，真实目录是 libbz2 / libcurl / liblzma）
       # -----------------------------------------------------------------------
+      # -----------------------------------------------------------------------
+      # 增包前置校验
+      #
+      # build-bootstraps.sh 的 `--add` 只做 `ADDITIONAL_PACKAGES+=("$pkg")`
+      # （L346-352），**不校验包名是否存在**。传一个不存在的名字，要等
+      # build_package 循环跑到它才报错 —— 那时前面几十个包已经编完，白等几小时。
+      # 这里提前用 repo.json 里的目录清单挡掉。
+      # -----------------------------------------------------------------------
+      - name: Preflight - add_packages exist
+        if: ${{ inputs.add_packages != '' }}
+        env:
+          ADD_PACKAGES: ${{ inputs.add_packages }}
+        run: |
+          set -uo pipefail
+          mapfile -t repos < <(jq -r 'del(.pkg_format) | keys | .[]' repo.json)
+          echo "repos: ${repos[*]}"
+
+          bad=0
+          for pkg in $(printf '%s' "$ADD_PACKAGES" | tr ',' ' '); do
+            [ -z "$pkg" ] && continue
+            hit=''
+            for r in "${repos[@]}"; do
+              [ -d "$r/$pkg" ] && { hit="$r"; break; }
+            done
+            if [ -z "$hit" ]; then
+              echo "::error title=add_packages::$pkg 不是合法包名（在 ${repos[*]} 里都没有对应目录）"
+              bad=1
+            else
+              printf 'ok  %-24s -> %s\n' "$pkg" "$hit/$pkg"
+            fi
+          done
+          [ "$bad" -eq 0 ] || {
+            echo '提示：只有**主包名**可以放进 --add；子包（xxx.subpackage.sh）由父包自动带出，不能单独指定。'
+            exit 1
+          }
+          echo ADD_PACKAGES_OK
+
       - name: Preflight - package names resolve
         run: |
           set -uo pipefail
@@ -455,7 +492,14 @@ jobs:
         run: |
           set -euo pipefail
           args=(--architectures "${{ matrix.arch }}")
-          if [ "$FORCE_REBUILD" = "true" ]; then args+=(-f); fi
+
+          # 永远加 -f：见 force_rebuild 输入项的说明。
+          # 复用旧 deb 缓存会得到前缀不一致的产物（默认包表现为"有残留"，
+          # 增包表现为 configure 阶段直接失败）。
+          args+=(-f)
+          if [ "$FORCE_REBUILD" != "true" ]; then
+            echo '::warning::force_rebuild=false 被忽略：换包名后必须强制重编，否则产物会带 com.termux 残留'
+          fi
           if [ -n "${ADD_PACKAGES:-}" ]; then args+=(--add "$ADD_PACKAGES"); fi
 
           echo "==> ./scripts/build-bootstraps.sh ${args[*]}"
@@ -531,10 +575,28 @@ jobs:
           echo
           echo '===== 结论 ====='
           echo "期望 PREFIX = /data/data/$PKG/files/usr"
-          if [ "$NEW" -gt 0 ] && [ "$OLD" -lt 50 ]; then
-            echo "PREFIX_SWITCH_LOOKS_OK  new=$NEW old=$OLD"
+          # 硬失败，不是 warning。
+          #
+          # 之前这里是 `OLD < 50` 就放行 —— 那个阈值等于承认"少量残留可以接受"，
+          # 而残留恰恰是最难发现的问题（产物能启动，但某些工具的 shebang 指向
+          # /data/data/com.termux/... 从而神秘失败）。既然换包名的目的就是把
+          # 前缀全部换掉，任何残留都是不合格产物，必须拦住。
+          #
+          # 允许一个例外集：这些是**必须**保持 com.termux 的（Shell API 的
+          # Intent component 名，见 workflow 顶部说明 TERMUX_APP__NAMESPACE）。
+          # 它们出现在 termux-tools / termux-am 的少数脚本里，不在 ELF 里。
+          ELF_OLD=$(strings -a chk/bin/* chk/lib/* 2>/dev/null | grep -c '/data/data/com.termux' || true)
+          echo "ELF_OLD_PREFIX_STRINGS = $ELF_OLD"
+
+          if [ "$NEW" -gt 0 ] && [ "$ELF_OLD" -eq 0 ]; then
+            echo "PREFIX_SWITCH_OK  new=$NEW old_files=$OLD elf_old=$ELF_OLD"
           else
-            echo "::warning::前缀替换可能不完整 new=$NEW old=$OLD"
+            echo "::error::前缀替换不合格 new=$NEW old_files=$OLD elf_old=$ELF_OLD"
+            echo '--- 仍含 com.termux 的文件（前 20）---'
+            grep -rlaF 'com.termux' chk 2>/dev/null | head -20
+            echo '--- ELF 里仍含旧前缀的位置（前 20）---'
+            strings -a chk/bin/* chk/lib/* 2>/dev/null | grep '/data/data/com.termux' | sort -u | head -20
+            exit 1
           fi
 
       - name: Upload artifact
