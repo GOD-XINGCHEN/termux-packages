@@ -748,6 +748,37 @@ jobs:
       # 反过来（先判产物缺失就 exit）会导致失败时日志从未被复制 ——
       # 这个坑已经踩过一次。
       # -----------------------------------------------------------------------
+      # -----------------------------------------------------------------------
+      # 收集日志与产物。**无论上一步成败都执行**（if: always()）。
+      #
+      # 这里不只要「搬到 out/」，而是在容器边界上做**多路救援**。
+      # 依据 Docker 官方文档，跨界可见性有几条硬规矩，每条都对应一条救援路径：
+      #
+      #   docker cp CONTAINER:SRC HOST_DST
+      #     · 文件在宿主侧的所有者 = 执行 cp 的那个 uid，**与容器内权限无关**
+      #       （文档："Files copied to the local machine are created with the
+      #        UID:GID of the user which invoked the docker cp command"）
+      #       → 这是绕过 bind 挂载写权限问题的关键手段，它不走挂载点。
+      #     · 但对 /proc /sys /dev、tmpfs、以及**用户建立的 mount** 无效
+      #       → 所以要额外用 `docker exec ... tar` 作为兜底。
+      #
+      #   docker exec -u <uid> CONTAINER ...
+      #     · 可指定任意 uid 执行（文档："Username or UID (format:
+      #       <name|uid>[:<group|gid>])"）
+      #       → builder 写的文件，宿主 uid 对不上也读得到，用 root 读。
+      #     · 容器 paused 时 exec 直接失败
+      #       → 所以每条路径单独判 rc，一条不行不影响下一条。
+      #
+      #   docker cp CONTAINER:... -
+      #     · `-` 表示以 tar 流读写 stdout/stdin
+      #       → 不经中间文件、不经挂载点，是最后一道保险。
+      #
+      # 救援顺序（前者成功即跳过后续）：
+      #   日志：宿主 /tmp → docker cp → exec+tar 流 → docker logs（PID1 stdout）
+      #   产物：docker cp → 仓库根 → exec+tar 流
+      # 全部失败时写诊断文件，保证 artifact 里能看出「为什么没拿到」，
+      # 而不是静默空上传（那会让人误以为步骤根本没跑）。
+      # -----------------------------------------------------------------------
       - name: Collect artifacts
         if: always()
         run: |
@@ -756,53 +787,115 @@ jobs:
           arch="${{ matrix.arch }}"
           flavor="${{ matrix.flavor.id }}"
           mkdir -p out
-
           LOGNAME="build-$arch-$flavor.log"
+          ZIPNAME="bootstrap-$arch-$flavor.zip"
+          LOGSRC=/home/builder/build-bootstrap.log
+          ZIPSRC=/home/builder/bootstrap-$arch.zip
 
-          # ---- 1) 日志：宿主 → out/
-          if [ -f /tmp/build-bootstrap.log ]; then
+          note() { echo "[collect] $*"; }
+
+          # ================== 日志：四路救援 ==================
+          got_log=0
+
+          # 路径 1：宿主 /tmp。Build step 用 tee 同时落了盘，
+          # 这是唯一不经 Docker 边界的一份，最简单可靠。
+          if [ -s /tmp/build-bootstrap.log ]; then
             cp -f /tmp/build-bootstrap.log "out/$LOGNAME"
-            echo "LOG host /tmp -> out/$LOGNAME ($(wc -l < "out/$LOGNAME") lines)"
-          fi
-
-          # ---- 2) 日志：容器兜底（宿主那份丢了也不至于没证据）
-          if [ ! -s "out/$LOGNAME" ]; then
-            docker cp "$cid:/home/builder/build-bootstrap.log" "out/$LOGNAME" 2>/dev/null \
-              && echo "LOG container /home/builder -> out/$LOGNAME"
-          fi
-
-          # ---- 3) 最后一道保险：三个位置都没有，就写一条占位，
-          #         保证 artifact 里至少有个文件说明「日志确实没拿到」，
-          #         而不是静默地什么都不上传（那会让人误以为步骤没跑）。
-          if [ ! -s "out/$LOGNAME" ]; then
-            {
-              echo "build log missing"
-              echo "arch=$arch flavor=$flavor"
-              echo "builder container inspect:"
-              docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' "$cid" 2>&1 || true
-              echo "container /home/builder:"
-              docker exec "$cid" ls -l /home/builder 2>&1 || true
-            } > "out/$LOGNAME"
-            echo "::warning::三个位置都没有完整日志，已写入占位说明"
-          fi
-
-          # ---- 4) 产物
-          if docker cp "$cid:/home/builder/bootstrap-$arch.zip" "out/bootstrap-$arch-$flavor.zip" 2>/dev/null; then
-            echo "COLLECTED via container:/home/builder"
-          elif [ -f "bootstrap-$arch.zip" ]; then
-            cp -v "bootstrap-$arch.zip" "out/bootstrap-$arch-$flavor.zip"
-            echo "COLLECTED via repo root"
+            got_log=1; note "log <- host:/tmp/build-bootstrap.log ($(wc -l < "out/$LOGNAME") lines)"
           else
-            echo "产物缺失（这是预期内的，如果上一步构建失败）"
+            note "log host:/tmp 不可用"
+          fi
+
+          # 路径 2：docker cp。走 daemon，不受 bind 挂载写权限限制。
+          if [ "$got_log" -eq 0 ] && docker cp "$cid:$LOGSRC" "out/$LOGNAME" 2>/dev/null; then
+            if [ -s "out/$LOGNAME" ]; then
+              got_log=1; note "log <- docker cp $cid:$LOGSRC"
+            else
+              rm -f "out/$LOGNAME"
+            fi
+          fi
+
+          # 路径 3：exec + tar 流。docker cp 对某些挂载点无效，这条能绕过。
+          # 用 -u 0（root）读，避免 builder 写的文件宿主 uid 读不到。
+          if [ "$got_log" -eq 0 ]; then
+            if docker exec -u 0 "$cid" tar -C "$(dirname "$LOGSRC")" -cf - "$(basename "$LOGSRC")" 2>/dev/null \
+                 | tar -xf - -C out 2>/dev/null; then
+              if [ -s "out/$(basename "$LOGSRC")" ]; then
+                mv -f "out/$(basename "$LOGSRC")" "out/$LOGNAME"
+                got_log=1; note "log <- exec tar stream"
+              fi
+            fi
+          fi
+
+          # 路径 4：docker logs（容器 PID1 的 stdout）。拿不到不影响前三条。
+          if [ "$got_log" -eq 0 ]; then
+            if docker logs "$cid" > "out/$LOGNAME" 2>&1 && [ -s "out/$LOGNAME" ]; then
+              got_log=1; note "log <- docker logs $cid"
+            else
+              rm -f "out/$LOGNAME"
+            fi
+          fi
+
+          # ================== 产物：三路救援 ==================
+          got_zip=0
+
+          # 路径 1：docker cp。产物是 build-bootstraps.sh 主动 copy 到
+          # /home/builder 的那一份（Patch publish_archive 已埋好），
+          # 不经 bind 挂载，因此不受仓库根不可写影响。
+          if docker cp "$cid:$ZIPSRC" "out/$ZIPNAME" 2>/dev/null && [ -s "out/$ZIPNAME" ]; then
+            got_zip=1; note "zip <- docker cp $cid:$ZIPSRC ($(stat -c%s "out/$ZIPNAME") bytes)"
+          else
+            rm -f "out/$ZIPNAME"
+          fi
+
+          # 路径 2：仓库根。mv 失败时脚本留警告，但若宿主侧确实落盘了，这里能捡到。
+          if [ "$got_zip" -eq 0 ] && [ -s "bootstrap-$arch.zip" ]; then
+            cp -f "bootstrap-$arch.zip" "out/$ZIPNAME"
+            got_zip=1; note "zip <- repo root"
+          fi
+
+          # 路径 3：exec + tar 流。
+          if [ "$got_zip" -eq 0 ]; then
+            if docker exec -u 0 "$cid" tar -C "$(dirname "$ZIPSRC")" -cf - "$(basename "$ZIPSRC")" 2>/dev/null \
+                 | tar -xf - -C out 2>/dev/null; then
+              if [ -s "out/$(basename "$ZIPSRC")" ]; then
+                mv -f "out/$(basename "$ZIPSRC")" "out/$ZIPNAME"
+                got_zip=1; note "zip <- exec tar stream"
+              fi
+            fi
+          fi
+
+          # ================== 失败时的诊断说明 ==================
+          if [ "$got_log" -eq 0 ]; then
+            {
+              echo "build log missing (all 4 rescue paths failed)"
+              echo "arch=$arch flavor=$flavor"
+              echo
+              echo "-- docker inspect --"
+              docker inspect --format 'status={{.State.Status}} exit={{.State.ExitCode}}' "$cid" 2>&1 || true
+              echo
+              echo "-- /home/builder --"
+              docker exec -u 0 "$cid" ls -la /home/builder 2>&1 || true
+              echo
+              echo "-- /tmp in container --"
+              docker exec -u 0 "$cid" ls -la /tmp 2>&1 | head -20 || true
+              echo
+              echo "-- docker ps --"
+              docker ps -a 2>&1 | head -10 || true
+            } > "out/$LOGNAME"
+            echo "::warning::日志四路救援全部失败，已写入诊断说明"
           fi
 
           ls -l out || true
 
-          # ---- 5) 判成败放到最后：日志已经安全落进 out/ 了
-          if [ ! -s "out/bootstrap-$arch-$flavor.zip" ]; then
-            echo "::error::产物缺失；构建日志已存入 artifact 的 $LOGNAME"
+          # ================== 判成败 ==================
+          # 放最后：日志已确保落进 out/，artifact 不会因这一步而丢。
+          if [ "$got_zip" -eq 0 ]; then
+            echo "::error::产物缺失（三路救援均失败）；日志已在 artifact 的 $LOGNAME"
             exit 1
           fi
+
+          echo "COLLECT_OK log=$got_log zip=$got_zip"
 
       # -----------------------------------------------------------------------
       # 把日志里的 ::error:: / 关键失败行提取到 Actions 摘要。
