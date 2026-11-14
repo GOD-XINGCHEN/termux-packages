@@ -191,8 +191,31 @@ jobs:
               ;;
           esac
           n=$(printf '%s' "$ADD_PACKAGES" | tr ',' '\n' | grep -c . || true)
-          echo "待校验 $n 个包"
+          echo "输入 $n 个包名，开始解析为主包名"
 
+          # ------------------------------------------------------------------
+          # 自动修正：子包名 -> 主包名
+          #
+          # 人写清单时用的是 dpkg 子包名或命令名（clang / xxd / aapt2），
+          # 但 --add 只接受主包目录名。这个映射是仓库自带的权威数据：
+          # 每个 <root>/<main>/<sub>.subpackage.sh 就定义了 sub -> main。
+          # 交给脚本自动做，不再要求人手工改清单。
+          #
+          # 脚本只做「子包->主包」这种完全可判定的映射；
+          # 真正无从判断的（拼写错误）仍然报错，并给出最接近的主包名。
+          # ------------------------------------------------------------------
+          chmod +x ./scripts/resolve-packages.py 2>/dev/null || true
+          if ! resolved=$(./scripts/resolve-packages.py "$ADD_PACKAGES"); then
+            echo "::error title=add_packages::有包名无法解析为主包（详见上面的 error 行）"
+            echo '提示：--add 只接受主包目录名；子包名会被自动修正，但拼错的名字需要改清单。'
+            exit 1
+          fi
+          ADD_PACKAGES="$resolved"
+
+          n2=$(printf '%s' "$ADD_PACKAGES" | tr ',' '\n' | grep -c . || true)
+          echo "解析后 $n2 个主包（去重后）：$ADD_PACKAGES"
+
+          # 二次校验：解析结果必须每个都能落到真实目录
           bad=0
           for pkg in $(printf '%s' "$ADD_PACKAGES" | tr ',' ' '); do
             [ -z "$pkg" ] && continue
@@ -201,16 +224,15 @@ jobs:
               [ -d "$r/$pkg" ] && { hit="$r"; break; }
             done
             if [ -z "$hit" ]; then
-              echo "::error title=add_packages::$pkg 不是合法包名（在 ${repos[*]} 里都没有对应目录）"
+              echo "::error title=add_packages::$pkg 解析后仍不是合法主包（不应发生）"
               bad=1
             else
               printf 'ok  %-24s -> %s\n' "$pkg" "$hit/$pkg"
             fi
           done
-          [ "$bad" -eq 0 ] || {
-            echo '提示：只有**主包名**可以放进 --add；子包（xxx.subpackage.sh）由父包自动带出，不能单独指定。'
-            exit 1
-          }
+          [ "$bad" -eq 0 ] || exit 1
+
+          echo "ADD_PACKAGES=$ADD_PACKAGES" >> "$GITHUB_OUTPUT"
           echo ADD_PACKAGES_OK
 
       - name: Preflight - package names resolve
@@ -617,12 +639,31 @@ jobs:
               ;;
             list|*)
               if [ -f "$LIST_FILE" ]; then
-                ADD_LIST=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$LIST_FILE" \
-                           | grep -v '^$' | awk '!seen[$0]++' | paste -sd, -)
+                ADD_LIST=$(cat "$LIST_FILE")
                 echo "==> package_mode=list：从 $LIST_FILE 读取"
+              else
+                echo "::error::package_mode=list 但 $LIST_FILE 不存在"
+                exit 1
               fi
               ;;
           esac
+
+          # ------------------------------------------------------------------
+          # 与 preflight 用**同一个**解析器把清单转成主包名。
+          #
+          # 之前 preflight 和 build 各写一份 sed 去注释 / 去重，
+          # 两份实现一旦漂移，就会出现「preflight 校验的这个集合」
+          # 和「实际传给 --add 的那个集合」不是同一个 —— 那是很难查的坑。
+          # 现在唯一实现是 scripts/resolve-packages.py，两处都调它。
+          # ------------------------------------------------------------------
+          if [ -n "$ADD_LIST" ]; then
+            chmod +x ./scripts/resolve-packages.py 2>/dev/null || true
+            if ! ADD_LIST=$(./scripts/resolve-packages.py "$ADD_LIST"); then
+              echo "::error::包名解析失败，见上面的 error 行"
+              exit 1
+            fi
+          fi
+
           if [ -n "$ADD_LIST" ]; then
             n=$(printf '%s' "$ADD_LIST" | tr ',' '\n' | grep -c . || true)
             echo "==> --add $n packages"
