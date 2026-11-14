@@ -119,15 +119,29 @@ jobs:
           # ------------------------------------------------------------------
           # 读白名单。文件不存在不算错（可能是刚 fork 的仓库）。
           # ------------------------------------------------------------------
+          # GitHub Actions 默认 shell 是 `bash -e {0}`，-e 是开着的。
+          # 早期版本这里写成 sed|grep|cut|paste 管道：白名单若全是注释行，
+          # grep 无匹配返回 1，pipefail 把整条管道判为失败，-e 立刻终止 step。
+          # 表现极具误导性 —— 打完 "dry_run=true" 就 exit 1，没有任何其它输出。
+          # 改用 awk：无论有无匹配都返回 0，不把「没有条目」当成错误。
           KEEP_IDS='[]'
           KEEP_PATHS='[]'
           if [ -f "$KEEP_FILE" ]; then
-            ids=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$KEEP_FILE" \
-                  | grep -E '^run:[0-9]+$' | cut -d: -f2 | paste -sd, -)
-            paths=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$KEEP_FILE" \
-                    | grep -E '^workflow:' | cut -d: -f2- | paste -sd, -)
-            [ -n "$ids" ]   && KEEP_IDS=$(printf '%s' "$ids"   | jq -R 'split(",") | map(tonumber)')
-            [ -n "$paths" ] && KEEP_PATHS=$(printf '%s' "$paths" | jq -R 'split(",")')
+            ids=$(awk '
+              { line = $0; sub(/#.*/, "", line); gsub(/[[:space:]]/, "", line) }
+              line ~ /^run:[0-9]+$/ { print substr(line, 5) }
+            ' "$KEEP_FILE" | paste -sd, -)
+            paths=$(awk '
+              { line = $0; sub(/#.*/, "", line); gsub(/[[:space:]]/, "", line) }
+              line ~ /^workflow:/ { print substr(line, 10) }
+            ' "$KEEP_FILE" | paste -sd, -)
+
+            if [ -n "$ids" ]; then
+              KEEP_IDS=$(printf '%s' "$ids" | jq -R 'split(",") | map(tonumber)')
+            fi
+            if [ -n "$paths" ]; then
+              KEEP_PATHS=$(printf '%s' "$paths" | jq -R 'split(",")')
+            fi
             echo "白名单 run id : $KEEP_IDS"
             echo "白名单 workflow: $KEEP_PATHS"
           else
@@ -147,8 +161,8 @@ jobs:
           page=1
           while :; do
             if ! batch=$(gh api "/repos/$REPO/actions/runs?per_page=100&page=$page" \
-                           --jq '[.workflow_runs[] | {id, name, workflow_id, status, conclusion, created_at, path}]' 2>"$raw.err"); then
-              err=$(head -3 "$raw.err" 2>/dev/null)
+                           --jq '[.workflow_runs[] | {id, name, workflow_id, status, conclusion, created_at, path}]' 2>"${raw}.err"); then
+              err=$(head -3 "${raw}.err" 2>/dev/null || true)
               echo "::error::第 $page 页抓取失败（限流或鉴权问题）：$err"
               exit 1
             fi
@@ -156,9 +170,14 @@ jobs:
             echo "page $page -> $n runs"
             [ "$n" -eq 0 ] && break
             printf '%s' "$batch" > "$raw"
-            # 按 id 去重后再累加，避免翻页位移导致重复
-            jq -s '.[0] + .[1] | unique_by(.id)' "$tmp" "$raw" > "$tmp.new" \
-              && mv "$tmp.new" "$tmp"
+            # 按 id 去重后再累加，避免翻页位移导致重复。
+            # 显式判返回码：jq 失败若静默跳过，会拿不完整名单去删，
+            # 算出的保留数量全错，比直接失败危险得多。
+            if ! jq -s '.[0] + .[1] | unique_by(.id)' "$tmp" "$raw" > "$tmp.new"; then
+              echo "::error::第 $page 页合并失败"
+              exit 1
+            fi
+            mv "$tmp.new" "$tmp"
             page=$((page+1))
             [ "$page" -gt 50 ] && { echo "::error::页数超过安全上限"; exit 1; }
           done
