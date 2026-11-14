@@ -398,7 +398,7 @@ main() {
 
 		if [[ $FORCE_BUILD_PACKAGES == "1" ]]; then
 			rm -f -- "${TERMUX_BUILT_PACKAGES_DIRECTORY_FOR_ARCH:?}/"*
-			rm -f "$TERMUX_BUILT_DEBS_DIRECTORY"/*
+			rm -f -- "${TERMUX_BUILT_DEBS_DIRECTORY:?}/"*
 		fi
 
 		BOOTSTRAP_ROOTFS="$BOOTSTRAP_TMPDIR/rootfs-${TERMUX_ARCH}"
