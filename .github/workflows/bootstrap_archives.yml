@@ -215,12 +215,21 @@ jobs:
           fi
 
           # 2) 清理 built-packages 目录前必须有 :? 保护
-          #    原写法 rm -f "$TERMUX_BUILT_PACKAGES_DIRECTORY_FOR_ARCH"/*
           #    变量为空时会变成 rm -f /*，必须拦。
-          if grep -qF 'rm -f -- "${TERMUX_BUILT_PACKAGES_DIRECTORY_FOR_ARCH:?}/"*' "$f"; then
+          #    变量名必须是 TERMUX_BUILT_PACKAGES_DIRECTORY（脚本第 34 行定义的那个），
+          #    不能是 _FOR_ARCH 后缀 —— 那个名字全仓库从未定义，
+          #    配合 :? 会让 force_rebuild 时直接报
+          #    "parameter null or not set" 并把整个构建打死。
+          if grep -qF 'rm -f -- "${TERMUX_BUILT_PACKAGES_DIRECTORY:?}/"*' "$f"; then
             echo "ok   built-packages rm guarded"
           else
-            echo "::error::缺 TERMUX_BUILT_PACKAGES_DIRECTORY_FOR_ARCH 的 :? 保护"; bad=1
+            echo "::error::缺 TERMUX_BUILT_PACKAGES_DIRECTORY 的 :? 保护"; bad=1
+          fi
+          # 反向断言：这个 bug 一旦被改回来，这里立刻拦住
+          if grep -qF 'TERMUX_BUILT_PACKAGES_DIRECTORY_FOR_ARCH' "$f"; then
+            echo "::error::脚本里仍有未定义的 TERMUX_BUILT_PACKAGES_DIRECTORY_FOR_ARCH"; bad=1
+          else
+            echo "ok   no undefined _FOR_ARCH variable"
           fi
 
           # 3) 清理 debs 目录前必须有 :? 保护（注意是 rm -f，不是 rm -rf）
