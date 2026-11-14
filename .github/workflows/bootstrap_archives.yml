@@ -141,17 +141,32 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Preflight - add_packages exist
         id: addlist
-        # 校验逻辑：优先用手填的，没有就校验默认清单。
-        # 之前这里 `if: inputs.add_packages != ''`，导致默认清单完全跳过校验 ——
-        # 112 个包名如果有拼错，会在编译几十分钟后才暴露。
-        # 恒开：清单来自 .github/bootstrap-add-packages.txt，输入非空时用它覆盖。
-        # 校验放前面很关键 —— 112 个包名里有一个写错，编译跑到一半才发现就是几十分钟白费。
+        # 恒开：清单来自 .github/bootstrap-add-packages.txt；dispatch 的 add_packages
+        # 非空时用它覆盖。校验必须放在编译之前 —— 一百多个包名里有一个写错，
+        # 等编译跑到一半才发现就是几十分钟白费。
         env:
           ADD_PACKAGES: ${{ inputs.add_packages }}
         run: |
           set -uo pipefail
           mapfile -t repos < <(jq -r 'del(.pkg_format) | keys | .[]' repo.json)
           echo "repos: ${repos[*]}"
+
+          # 和 build 步骤用同一套逻辑取清单，避免两处不一致
+          # （之前 preflight 只认 inputs，build 只认 env，两边校验的根本不是同一个集合）
+          LIST_FILE=".github/bootstrap-add-packages.txt"
+          if [ -z "${ADD_PACKAGES:-}" ] && [ -f "$LIST_FILE" ]; then
+            ADD_PACKAGES=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$LIST_FILE" \
+                           | grep -v '^$' | awk '!seen[$0]++' | paste -sd, -)
+            echo "清单来源: $LIST_FILE"
+          elif [ -n "${ADD_PACKAGES:-}" ]; then
+            echo "清单来源: dispatch 输入（覆盖清单文件）"
+          else
+            echo "::warning::$LIST_FILE 不存在且无输入，跳过增包校验"
+            echo ADD_PACKAGES_OK
+            exit 0
+          fi
+          n=$(printf '%s' "$ADD_PACKAGES" | tr ',' '\n' | grep -c . || true)
+          echo "待校验 $n 个包"
 
           bad=0
           for pkg in $(printf '%s' "$ADD_PACKAGES" | tr ',' ' '); do
