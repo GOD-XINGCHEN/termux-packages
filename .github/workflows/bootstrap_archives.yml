@@ -692,39 +692,66 @@ jobs:
 
           echo "==> ./scripts/run-docker.sh ./scripts/build-bootstraps.sh ${args[*]}"
           echo "==> 开始时间 $(date -u +%FT%TZ)"
+          # 后台守护：心跳 + **持续把容器内日志备份到宿主**
+          #
+          # 为什么必须持续备份，而不是最后再救：
+          #   Collect 步骤有多路救援（宿主 /tmp、docker cp、exec+tar、
+          #   docker logs），但它们全都依赖「容器还在、且里面文件还在」。
+          #   一旦容器在构建后被删除、或 runner 被回收，这些路会同时断，
+          #   到那时一点日志都拿不到 —— 而日志恰恰是唯一能用来修东西的东西。
+          #
+          #   所以把救援提前：构建一开始就起后台循环，每 60 秒从容器里
+          #   捞一次日志到宿主，形成滚动快照。即便最终容器消失，
+          #   宿主上也已有截至最后一分钟的内容。
+          #
+          # 循环里做三件事：
+          #   1. 备份：优先 docker cp（走 daemon，不受 bind 挂载权限限制），
+          #      失败退回 exec+tar 流（绕过 docker cp 对 mount 的限制）。
+          #   2. 心跳：打印时间戳与当前行数，行数长时间不变 = 卡住。
+          #   3. 备份失败也回显，便于判断是哪条路走不通。
+          #
+          # 用 -u 0 读容器文件：builder 写的日志宿主 uid 可能读不到。
+          SNAP=/tmp/build-bootstrap.snapshot.log
+          : > "$SNAP"
 
-          # ------------------------------------------------------------------
-          # 日志必须**实时**可见。
-          #
-          # 早期版本写成 `cmd > "$LOG" 2>&1` 再在末尾 `cat "$LOG"`：
-          # 目的是保证失败时一定有完整日志，但代价是整个编译期间
-          # Actions 步骤日志是空的 —— 构建卡住时完全看不出卡在哪个包，
-          # 也不知道到底在编什么。默认（不增包）的构建反而能实时看到
-          # 几十万行输出，这个反差正说明问题出在这里。
-          #
-          # 改成 tee：边跑边输出，同时落盘留底。
-          # 管道会丢掉被测命令的退出码，所以退出码必须从 PIPESTATUS[0] 取，
-          # 不能用 $?（那是 tee 的退出码，永远是 0）。
-          # ------------------------------------------------------------------
-          #
-          # 另外加一个心跳：每 5 分钟在日志里打一行当前时间和日志行数。
-          # 作用是在长时间无输出（比如某个包 configure 卡住）时，
-          # 仍能判断进程是活的还是死的，而不是盯着空白页干等。
-          (
-            while sleep 300; do
-              printf '\n[heartbeat %s] log lines=%s size=%s\n' \
-                "$(date -u +%FT%TZ)" \
+          guard_loop() {
+            while sleep 60; do
+              ts=$(date -u +%FT%TZ)
+              if ! docker cp "termux-package-builder:/home/builder/build-bootstrap.log" \
+                     "$SNAP" 2>/dev/null || [ ! -s "$SNAP" ]; then
+                if docker exec -u 0 termux-package-builder \
+                     tar -C /home/builder -cf - build-bootstrap.log 2>/dev/null \
+                     | tar -xf - -C /tmp 2>/dev/null && [ -s /tmp/build-bootstrap.log ]; then
+                  cp -f /tmp/build-bootstrap.log "$SNAP" 2>/dev/null || true
+                fi
+              fi
+              printf '[heartbeat %s] stream_lines=%s snapshot_lines=%s\n' \
+                "$ts" \
                 "$(wc -l < "$LOG" 2>/dev/null || echo 0)" \
-                "$(wc -c < "$LOG" 2>/dev/null || echo 0)"
+                "$(wc -l < "$SNAP" 2>/dev/null || echo 0)"
             done
-          ) &
+          }
+          guard_loop &
           hb_pid=$!
+
+          final_sync() {
+            kill "$hb_pid" 2>/dev/null || true
+            wait "$hb_pid" 2>/dev/null || true
+            docker cp "termux-package-builder:/home/builder/build-bootstrap.log" \
+              "$SNAP" 2>/dev/null || true
+            if [ -s "$SNAP" ]; then
+              echo "==> snapshot lines $(wc -l < "$SNAP")"
+            else
+              echo "==> snapshot empty (no /home/builder/build-bootstrap.log in container)"
+            fi
+          }
+          trap final_sync EXIT INT TERM
 
           ./scripts/run-docker.sh ./scripts/build-bootstraps.sh "${args[@]}" 2>&1 | tee -a "$LOG"
           rc=${PIPESTATUS[0]}
 
-          kill "$hb_pid" 2>/dev/null || true
-          wait "$hb_pid" 2>/dev/null || true
+          final_sync
+          trap - EXIT INT TERM
 
           echo
           echo "==> 结束时间 $(date -u +%FT%TZ)，退出码 $rc，日志 $(wc -l < "$LOG") 行"
@@ -794,8 +821,19 @@ jobs:
 
           note() { echo "[collect] $*"; }
 
-          # ================== 日志：四路救援 ==================
+          # ================== 日志：五路救援 ==================
           got_log=0
+
+          # 路径 0：**滚动快照**（Build step 的后台守护每 60 秒同步一次）。
+          #
+          # 这是最可靠的一路，因为它不依赖「Collect 运行时容器还在」：
+          # 快照早在构建过程中就持续落到宿主 /tmp 了。即便容器被删、
+          # runner 回收、docker daemon 出问题，这份也还在。
+          #
+          # 判据用「有内容」，而不是无条件覆盖：构建正常结束时
+          # /tmp/build-bootstrap.log（tee 的落盘）通常更完整，
+          # 所以下面路径 1 仍然优先；只有当它缺失时才用快照。
+          SNAP=/tmp/build-bootstrap.snapshot.log
 
           # 路径 1：宿主 /tmp。Build step 用 tee 同时落了盘，
           # 这是唯一不经 Docker 边界的一份，最简单可靠。
@@ -804,6 +842,13 @@ jobs:
             got_log=1; note "log <- host:/tmp/build-bootstrap.log ($(wc -l < "out/$LOGNAME") lines)"
           else
             note "log host:/tmp 不可用"
+          fi
+
+          # 路径 1b：滚动快照兜底。/tmp 的 tee 文件丢了，但守护进程
+          # 在构建过程中已经捞过若干次，这份能补上。
+          if [ "$got_log" -eq 0 ] && [ -s "$SNAP" ]; then
+            cp -f "$SNAP" "out/$LOGNAME"
+            got_log=1; note "log <- rolling snapshot ($(wc -l < "out/$LOGNAME") lines)"
           fi
 
           # 路径 2：docker cp。走 daemon，不受 bind 挂载写权限限制。
@@ -882,6 +927,17 @@ jobs:
               echo
               echo "-- docker ps --"
               docker ps -a 2>&1 | head -10 || true
+              echo
+              echo "-- rolling snapshot --"
+              if [ -s "$SNAP" ]; then
+                echo "snapshot exists: $(wc -l < "$SNAP") lines"
+                echo "(snapshot was also tried as rescue path 1b)"
+              else
+                echo "snapshot empty -- guard loop never captured anything"
+              fi
+              echo
+              echo "-- heartbeat log (host side) --"
+              grep -a '\[heartbeat' /tmp/build-bootstrap.log 2>/dev/null | tail -20 || echo '(none)'
             } > "out/$LOGNAME"
             echo "::warning::日志四路救援全部失败，已写入诊断说明"
           fi
