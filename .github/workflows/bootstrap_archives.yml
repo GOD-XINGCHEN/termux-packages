@@ -38,6 +38,18 @@ on:
         description: "额外打入 bootstrap 的包，逗号分隔（可留空）"
         required: false
         default: ""
+      download_retries:
+        description: "源码下载总尝试次数（含首次）。默认 6；退避 15/30/60/120/240 秒"
+        required: false
+        default: "6"
+      download_retry_delay:
+        description: "下载重试退避基数（秒），每次失败翻倍"
+        required: false
+        default: "15"
+      download_retry_max:
+        description: "单次退避上限（秒）"
+        required: false
+        default: "300"
       force_rebuild:
         description: "强制重编（-f）。**必须保持 true**：换过包名后，旧 deb 缓存里的 ELF 仍烧着 com.termux 前缀，复用会产出「有残留」的坏 bootstrap；增包时依赖 deb 前缀不一致还会让 configure 直接失败"
         required: false
@@ -518,9 +530,27 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Build bootstrap archive
         id: build
+        env:
+          # 下载重试策略。注意这层 env 只是给下面的 shell 用的，
+          # 真正进容器靠 TERMUX_DOCKER_EXEC_EXTRA_ARGS 转发（见下）。
+          DL_RETRIES: ${{ inputs.download_retries }}
+          DL_DELAY: ${{ inputs.download_retry_delay }}
+          DL_MAX: ${{ inputs.download_retry_max }}
         run: |
           set +e
           args=(--architectures "${{ matrix.arch }}")
+
+          # ------------------------------------------------------------------
+          # run-docker.sh 只转发 CI / DOCKER_EXEC_PID_FILE_PATH 两个变量进容器，
+          # 宿主的 export 到不了 build-bootstraps.sh。唯一可用的通道是
+          # TERMUX_DOCKER_EXEC_EXTRA_ARGS，它会被原样拼进 docker exec。
+          # 这里显式补三个 --env，让 termux_download 的重试参数真正生效。
+          # ------------------------------------------------------------------
+          export TERMUX_DOCKER_EXEC_EXTRA_ARGS="${TERMUX_DOCKER_EXEC_EXTRA_ARGS:-} --env TERMUX_DOWNLOAD_RETRIES=${DL_RETRIES:-6} --env TERMUX_DOWNLOAD_RETRY_DELAY=${DL_DELAY:-15} --env TERMUX_DOWNLOAD_RETRY_MAX=${DL_MAX:-300}"
+          echo "retry policy: ${DL_RETRIES:-6} attempts, base ${DL_DELAY:-15}s, cap ${DL_MAX:-300}s"
+          echo "docker exec extra args: ${TERMUX_DOCKER_EXEC_EXTRA_ARGS}"
+          # 自检：确认容器里真的能读到（失败也不中断，只是留证据）
+          docker exec termux-package-builder env 2>/dev/null | grep -q TERMUX_DOWNLOAD || true
 
           # 永远加 -f：换包名后旧 deb 缓存里的 ELF 仍烧着 com.termux 前缀
           args+=(-f)
