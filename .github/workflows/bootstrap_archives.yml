@@ -35,7 +35,7 @@ on:
         required: false
         default: "aarch64"
       add_packages:
-        description: "额外打入 bootstrap 的包，逗号分隔（可留空）"
+        description: "额外打入 bootstrap 的包，逗号分隔。留空 = 使用下方的 DEFAULT_ADD_PACKAGES 全套工具链"
         required: false
         default: ""
       download_retries:
@@ -110,6 +110,28 @@ jobs:
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 355
+    env:
+      # ---------------------------------------------------------------------------
+      # 默认增包清单 —— 对齐 Sources-AI-v3 里那份 539MB bootstrap 的工具链。
+      #
+      # 来源：把 v3 的 var/lib/dpkg/status 与我们的逐包比对，得到 112 个「v3 有、我们没有」
+      # 的包。v3 是 221 个包 / 27,820 文件 / 689 个命令；默认包集只有 159 个包 / 423 个命令，
+      # 缺的正是整套开发工具链。
+      #
+      # 分类速览：
+      #   Clang/LLVM   clang libllvm lld llvm libcompiler-rt libc++
+      #   NDK          ndk-sysroot binutils libandroid-* 系列
+      #   Android 逆向  apktool apksigner aapt aapt2 d8 dx dex2jar jadx procyon-decompiler
+      #   调试分析     gdb elfutils libelf libdw libdebuginfod strace ltrace radare2
+      #   网络         aria2 dnsutils ldns nmap openssh dropbear rsync wget socat
+      #   构建         cmake ninja patchelf
+      #   运行时       nodejs-lts npm openjdk-21 python-pip lua54 dbus pulseaudio
+      #   Termux 集成   termux-api termux-auth proot proot-distro tsu
+      #
+      # 加包时如果某个包依赖链上有源码站不可达，会重复之前 dash 的问题 ——
+      # 届时用 src-mirror Release 镜像同样的办法处理，下载器已有 6 次指数退避重试。
+      # ---------------------------------------------------------------------------
+      DEFAULT_ADD_PACKAGES: "aapt,aapt2,abseil-cpp,alsa-lib,alsa-plugins,apksigner,apktool,argp,aria2,binutils,busybox,c-ares,clang,cmake,cmocka,d8,dbus,dex2jar,dnsutils,dropbear,dx,elfutils,fmt,gdb,git,guile,hexedit,htop,jadx,jq,json-c,jsoncpp,krb5,ldns,libandroid-execinfo,libandroid-shmem,libandroid-spawn,libandroid-stub,libandroid-sysv-semaphore,libarchive,libasm,libcap,libcompiler-rt,libdebuginfod,libdw,libedit,libelf,libflac,libgc,libicu,libjpeg-turbo,libllvm,libltdl,libmicrohttpd,libmp3lame,libmpg123,libogg,libopus,libpcap,libpopt,libprotobuf,libresolv-wrapper,libsndfile,libsodium,libsoxr,libtalloc,libthread-db,liburcu,libuv,libvorbis,libwebrtc-audio-processing,libzopfli,littlecms,lld,llvm,ltrace,lua54,ndk-sysroot,ninja,nmap,nodejs-lts,npm,oniguruma,openjdk-21,openssh,openssh-sftp-server,patchelf,procyon-decompiler,proot,proot-distro,pulseaudio,python-pip,radare2,rhash,rsync,socat,speexdsp,strace,termux-api,termux-auth,tmux,traceroute,tree,tsu,utf8proc,vim,wget,which,xmlstarlet,xxd,zip,zsh"
     permissions:
       # 发 Release 需要 write。两个 matrix 并行跑，各自创建/更新同名 Release
       # 可能撞车，所以用「同一个 tag + 覆盖上传」策略（见 Publish step）。
