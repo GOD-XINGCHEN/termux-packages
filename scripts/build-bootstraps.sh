@@ -397,7 +397,7 @@ main() {
 		termux_step_handle_buildarch
 
 		if [[ $FORCE_BUILD_PACKAGES == "1" ]]; then
-			rm -f -- "${TERMUX_BUILT_PACKAGES_DIRECTORY_FOR_ARCH:?}/"*
+			rm -f -- "${TERMUX_BUILT_PACKAGES_DIRECTORY:?}/"*
 			rm -f -- "${TERMUX_BUILT_DEBS_DIRECTORY:?}/"*
 		fi
 
