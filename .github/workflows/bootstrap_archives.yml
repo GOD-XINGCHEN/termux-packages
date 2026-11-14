@@ -503,9 +503,14 @@ jobs:
           if [ -n "${ADD_PACKAGES:-}" ]; then args+=(--add "$ADD_PACKAGES"); fi
 
           echo "==> ./scripts/build-bootstraps.sh ${args[*]}"
-          ./scripts/run-docker.sh ./scripts/build-bootstraps.sh "${args[@]}"
+          # tee 到文件：失败时这个文件会被 Collect 步骤一并带出，
+          # 这样即使 Actions 日志接口取不到（token 常缺 actions:read），
+          # 也能从 artifact 里拿到完整报错。
+          set -o pipefail
+          ./scripts/run-docker.sh ./scripts/build-bootstraps.sh "${args[@]}" 2>&1 | tee /tmp/build-bootstrap.log
 
       - name: Collect artifacts
+        if: always()
         run: |
           set -uo pipefail
           cid=termux-package-builder
@@ -528,8 +533,15 @@ jobs:
             exit 1
           fi
 
+          # 日志一并带出（失败时最需要它）
+          cp -f /tmp/build-bootstrap.log "out/build-$arch-$flavor.log" 2>/dev/null || true
+
+          if [ ! -s "out/bootstrap-$arch-$flavor.zip" ]; then
+            echo "::error::产物为空，构建日志见 artifact 里的 build-$arch-$flavor.log"
+            ls -l out || true
+            exit 1
+          fi
           ls -l out
-          test -s "out/bootstrap-$arch-$flavor.zip" || { echo "::error::产物为空"; exit 1; }
 
       # -----------------------------------------------------------------------
       # 验收：证明前缀是真的编译进去了，不是只改了目录名
@@ -600,9 +612,11 @@ jobs:
           fi
 
       - name: Upload artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: bootstrap-${{ matrix.flavor.id }}-${{ matrix.arch }}
-          path: out/*.zip
-          if-no-files-found: error
+          # 带上 build-*.log：失败时这是唯一能拿到的完整报错
+          path: out/*
+          if-no-files-found: warn
           retention-days: 30
