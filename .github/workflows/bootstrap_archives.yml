@@ -748,10 +748,9 @@ jobs:
           echo "==> 结束时间 $(date -u +%FT%TZ) 退出码=$rc 日志=${total_lines}行/${total_size}字节"
           echo "==> snapshot=$(wc -l < "$SNAP" 2>/dev/null || echo 0) 行"
 
-          # 只打印尾部，避免整本日志刷屏。全文见 artifact。
-          echo '===== 日志尾部 200 行 ====='
-          tail -200 "$LOG" 2>/dev/null || true
-          echo '===== 尾部结束 ====='
+          # 输出完整日志（与原始流程一致）。
+          # 注：这一步是一次性倒出，构建过程中不会有任何输出。
+          cat "$LOG" 2>/dev/null || true
 
           # 失败时把关键错误行单独拎出来，便于一眼定位
           if [ "$rc" -ne 0 ]; then
