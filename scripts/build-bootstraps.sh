@@ -315,6 +315,66 @@ create_bootstrap_archive() {
 
 	termux_bootstrap_replace_prefix
 
+	# =========================================================================
+	# 注入 opt/ 静态资源（dex2jar / Sources-AI-dexkit）
+	#
+	# 这些不是通过 termux 包管理器安装的，是直接放进 $PREFIX/opt/ 的静态文件：
+	#   opt/dex2jar/                dex↔jar 转换工具（含 lib/*.jar 依赖）
+	#   opt/Sources-AI-dexkit/      APK 脱壳/逆向一体工具
+	#     bin/apksigner             签名包装（apksigner.jar from build-tools 37）
+	#     bin/Sources-AI-unpack     脱壳/逆向入口
+	#     lib/dump.js               frida 内存 DEX 扫描脚本
+	#     payload/frida-*.xz        frida server/inject/gadget（arm64 + arm）
+	#     tools/apksigner.jar       来自 Android build-tools 37.0.0
+	#     tools/debug.keystore
+	#
+	# 源文件保存在仓库的 termux-bootstrap-opt/ 目录（与 opt/ 下布局一致），
+	# 这里原样拷到 $PREFIX/opt/，随 zip 一起打进 bootstrap。
+	#
+	# 注意：这些文件在打包前已经做过路径改写（com.termux -> 当前包名），
+	# 其中的 shebang 和 PREFIX 默认值都指向新路径。
+	# =========================================================================
+	termux_bootstrap_install_opt() {
+		local srcdir="${TERMUX_SCRIPTDIR}/termux-bootstrap-opt"
+		local destdir="${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}/opt"
+
+		if [ ! -d "$srcdir" ]; then
+			echo "[*] skip opt install: no $srcdir"
+			return 0
+		fi
+
+		echo "[*] Installing opt/ assets from $srcdir"
+		mkdir -p "$destdir"
+
+		# cp -a 保留权限；某些脚本需要可执行位
+		cp -a "$srcdir"/. "$destdir"/
+
+		# 显式修正可执行位：bin/ 下的包装脚本必须有 +x，
+		# 否则 termux 里调用会 "Permission denied"。
+		# zip 会保留 unix 权限位，所以这一步在打包前必须做对。
+		find "$destdir" -type f 			\( -path '*/bin/*' -o -path '*/dex2jar/*.sh' \) 			-exec chmod 755 {} + 2>/dev/null || true
+
+		# frida payload 是 .xz 压缩包，保持 644 即可
+		find "$destdir" -name '*.xz' -exec chmod 644 {} + 2>/dev/null || true
+
+		local n
+		n=$(find "$destdir" -type f | wc -l)
+		local sz
+		sz=$(du -sb "$destdir" 2>/dev/null | awk '{print $1}')
+		echo "[*] opt installed: files=$n size=${sz:-?} bytes"
+
+		# 自检：确认关键入口存在且可执行
+		for f in opt/Sources-AI-dexkit/bin/Sources-AI-unpack 		         opt/Sources-AI-dexkit/bin/apksigner 		         opt/dex2jar/bin/dex-tools; do
+			if [ -x "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}/$f" ]; then
+				echo "    ok  $f (executable)"
+			else
+				echo "    [!] MISSING or not executable: $f"
+			fi
+		done
+	}
+
+	termux_bootstrap_install_opt
+
 	(cd "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}"
 		# Do not store symlinks in bootstrap archive.
 		# Instead, put all information to SYMLINKS.txt
