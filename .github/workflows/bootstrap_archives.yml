@@ -110,28 +110,6 @@ jobs:
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 355
-    env:
-      # ---------------------------------------------------------------------------
-      # 默认增包清单 —— 对齐 Sources-AI-v3 里那份 539MB bootstrap 的工具链。
-      #
-      # 来源：把 v3 的 var/lib/dpkg/status 与我们的逐包比对，得到 112 个「v3 有、我们没有」
-      # 的包。v3 是 221 个包 / 27,820 文件 / 689 个命令；默认包集只有 159 个包 / 423 个命令，
-      # 缺的正是整套开发工具链。
-      #
-      # 分类速览：
-      #   Clang/LLVM   clang libllvm lld llvm libcompiler-rt libc++
-      #   NDK          ndk-sysroot binutils libandroid-* 系列
-      #   Android 逆向  apktool apksigner aapt aapt2 d8 dx dex2jar jadx procyon-decompiler
-      #   调试分析     gdb elfutils libelf libdw libdebuginfod strace ltrace radare2
-      #   网络         aria2 dnsutils ldns nmap openssh dropbear rsync wget socat
-      #   构建         cmake ninja patchelf
-      #   运行时       nodejs-lts npm openjdk-21 python-pip lua54 dbus pulseaudio
-      #   Termux 集成   termux-api termux-auth proot proot-distro tsu
-      #
-      # 加包时如果某个包依赖链上有源码站不可达，会重复之前 dash 的问题 ——
-      # 届时用 src-mirror Release 镜像同样的办法处理，下载器已有 6 次指数退避重试。
-      # ---------------------------------------------------------------------------
-      DEFAULT_ADD_PACKAGES: "aapt,aapt2,abseil-cpp,alsa-lib,alsa-plugins,apksigner,apktool,argp,aria2,binutils,busybox,c-ares,clang,cmake,cmocka,d8,dbus,dex2jar,dnsutils,dropbear,dx,elfutils,fmt,gdb,git,guile,hexedit,htop,jadx,jq,json-c,jsoncpp,krb5,ldns,libandroid-execinfo,libandroid-shmem,libandroid-spawn,libandroid-stub,libandroid-sysv-semaphore,libarchive,libasm,libcap,libcompiler-rt,libdebuginfod,libdw,libedit,libelf,libflac,libgc,libicu,libjpeg-turbo,libllvm,libltdl,libmicrohttpd,libmp3lame,libmpg123,libogg,libopus,libpcap,libpopt,libprotobuf,libresolv-wrapper,libsndfile,libsodium,libsoxr,libtalloc,libthread-db,liburcu,libuv,libvorbis,libwebrtc-audio-processing,libzopfli,littlecms,lld,llvm,ltrace,lua54,ndk-sysroot,ninja,nmap,nodejs-lts,npm,oniguruma,openjdk-21,openssh,openssh-sftp-server,patchelf,procyon-decompiler,proot,proot-distro,pulseaudio,python-pip,radare2,rhash,rsync,socat,speexdsp,strace,termux-api,termux-auth,tmux,traceroute,tree,tsu,utf8proc,vim,wget,which,xmlstarlet,xxd,zip,zsh"
     permissions:
       # 发 Release 需要 write。两个 matrix 并行跑，各自创建/更新同名 Release
       # 可能撞车，所以用「同一个 tag + 覆盖上传」策略（见 Publish step）。
@@ -162,12 +140,14 @@ jobs:
       # 这里提前用 repo.json 里的目录清单挡掉。
       # -----------------------------------------------------------------------
       - name: Preflight - add_packages exist
+        id: addlist
         # 校验逻辑：优先用手填的，没有就校验默认清单。
         # 之前这里 `if: inputs.add_packages != ''`，导致默认清单完全跳过校验 ——
         # 112 个包名如果有拼错，会在编译几十分钟后才暴露。
-        if: ${{ inputs.add_packages != '' || env.DEFAULT_ADD_PACKAGES != '' }}
+        # 恒开：清单来自 .github/bootstrap-add-packages.txt，输入非空时用它覆盖。
+        # 校验放前面很关键 —— 112 个包名里有一个写错，编译跑到一半才发现就是几十分钟白费。
         env:
-          ADD_PACKAGES: ${{ inputs.add_packages != '' && inputs.add_packages || env.DEFAULT_ADD_PACKAGES }}
+          ADD_PACKAGES: ${{ inputs.add_packages }}
         run: |
           set -uo pipefail
           mapfile -t repos < <(jq -r 'del(.pkg_format) | keys | .[]' repo.json)
@@ -575,9 +555,28 @@ jobs:
           # 之前这里只有 --architectures，DEFAULT_ADD_PACKAGES 定义了却从没拼上，
           # 等于白写。build-bootstraps.sh 的 --add 只认主包名，逗号分隔。
           # ------------------------------------------------------------------
+          # ------------------------------------------------------------------
+          # 增包清单来源（优先级从高到低）：
+          #   1. dispatch 的 add_packages 输入（临时覆盖，用于试验单个包）
+          #   2. .github/bootstrap-add-packages.txt（长期清单，增删只改这个文件）
+          #
+          # 用文件而不是 YAML env 的原因：包名是数据不是逻辑。写死在 workflow 里，
+          # 增删一个包都要改流水线，且 981 字符的单行串 diff 根本看不出改了啥。
+          # ------------------------------------------------------------------
+          LIST_FILE=".github/bootstrap-add-packages.txt"
           ADD_LIST="${ADD_PACKAGES_INPUT:-}"
           if [ -z "$ADD_LIST" ]; then
-            ADD_LIST="${DEFAULT_ADD_PACKAGES:-}"
+            if [ -f "$LIST_FILE" ]; then
+              # 去掉注释和空行，去重，逗号拼接
+              ADD_LIST=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$LIST_FILE" \
+                         | grep -v '^$' | awk '!seen[$0]++' | paste -sd, -)
+              echo "==> 从 $LIST_FILE 读取增包清单"
+            else
+              echo "::warning::$LIST_FILE 不存在，将使用默认包集"
+              ADD_LIST=""
+            fi
+          else
+            echo "==> 使用 dispatch 输入的 add_packages 覆盖清单"
           fi
           if [ -n "$ADD_LIST" ]; then
             n=$(printf '%s' "$ADD_LIST" | tr ',' '\n' | grep -c . || true)
