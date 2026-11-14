@@ -847,14 +847,37 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
 
-      - name: Upload artifact
+      # -----------------------------------------------------------------------
+      # 上传分成两个 artifact：产物一个，日志一个。
+      #
+      # 为什么不放一起（之前就是 path: out/* 一把梭）：
+      #   - 产物是 zip，手机上还要解一层；日志跟着一起进去，等于每次下载
+      #     都要白拉几十万行文本。
+      #   - 两者生命周期不同：产物要长期留存给 App 拉取，日志只在排查时看一眼。
+      #   - 成功时日志也照样上传（这里恒为 if: always()），
+      #     所以「成功时看不到日志」的问题不存在了。
+      #
+      # 日志**只**走 artifact，不进 Release。
+      # Release 只放产物 zip，见下面 Publish to Release 里只挑 bootstrap-*.zip。
+      # -----------------------------------------------------------------------
+      - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bootstrap-${{ matrix.flavor.id }}-${{ matrix.arch }}
-          # 带上 build-*.log：失败时这是唯一能拿到的完整报错
-          path: out/*
+          name: build-log-${{ matrix.flavor.id }}-${{ matrix.arch }}
+          path: out/build-*.log
           if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload bootstrap archive
+        # 只有构建成功且真的存在 zip 才上传。失败时没有产物可传，
+        # 上面那步的日志已经覆盖了排查需求。
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-${{ matrix.flavor.id }}-${{ matrix.arch }}
+          path: out/bootstrap-*.zip
+          if-no-files-found: error
           retention-days: 30
 
       # -----------------------------------------------------------------------
@@ -883,11 +906,19 @@ jobs:
 
           # 只有真的产出 zip 才发布：Collect 阶段已保证 out/ 里有日志，
           # 这里必须只挑 bootstrap-*.zip，别把日志也发上去。
+          # 只挑 bootstrap-*.zip。日志（build-*.log）永远不进 Release ——
+          # Release 是对外分发产物的地方，不该混入几十万行的构建日志。
+          #
+          # 这里再显式校验一次扩展名：万一 out/ 里出现别的 zip（比如中间产物），
+          # 也不会被误发。
           ZIP=$(ls out/bootstrap-*.zip 2>/dev/null | head -1)
           if [ -z "$ZIP" ]; then
             echo "::warning::没有产物 zip，跳过 Release 发布"
             exit 0
           fi
+          case "$ZIP" in
+            *build-*.log*) echo "::error::拒绝把日志当产物发布：$ZIP"; exit 1 ;;
+          esac
           echo "upload: $ZIP ($(stat -c%s "$ZIP") bytes)"
 
           TAG="bootstrap-${FLAVOR}-latest"
