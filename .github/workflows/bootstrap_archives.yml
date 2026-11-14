@@ -35,7 +35,7 @@ on:
         required: false
         default: "aarch64"
       add_packages:
-        description: "额外打入 bootstrap 的包，逗号分隔。留空 = 使用下方的 DEFAULT_ADD_PACKAGES 全套工具链"
+        description: "临时覆盖用的增包清单，逗号分隔。**留空即可** —— 默认读取 .github/bootstrap-add-packages.txt"
         required: false
         default: ""
       download_retries:
@@ -556,19 +556,18 @@ jobs:
           DL_RETRIES: ${{ inputs.download_retries }}
           DL_DELAY: ${{ inputs.download_retry_delay }}
           DL_MAX: ${{ inputs.download_retry_max }}
-          # dispatch 手填的增包清单；留空则回落 DEFAULT_ADD_PACKAGES
+          # dispatch 手填的增包清单；留空则回落 .github/bootstrap-add-packages.txt
           ADD_PACKAGES_INPUT: ${{ inputs.add_packages }}
         run: |
           set +e
           args=(--architectures "${{ matrix.arch }}")
 
           # ------------------------------------------------------------------
-          # 把增包清单接进来。
-          #   inputs.add_packages 非空 -> 用它（手动覆盖）
-          #   否则 -> 用 DEFAULT_ADD_PACKAGES（对齐 v3 的完整工具链）
+          # 把增包清单接进来。来源优先级：
+          #   1. inputs.add_packages 非空 -> 用它（临时试验单个包时方便）
+          #   2. 否则读 .github/bootstrap-add-packages.txt（长期清单）
           #
-          # 之前这里只有 --architectures，DEFAULT_ADD_PACKAGES 定义了却从没拼上，
-          # 等于白写。build-bootstraps.sh 的 --add 只认主包名，逗号分隔。
+          # build-bootstraps.sh 的 --add 只认主包名，逗号分隔。
           # ------------------------------------------------------------------
           # ------------------------------------------------------------------
           # 增包清单来源（优先级从高到低）：
