@@ -689,72 +689,77 @@ jobs:
 
           LOG=/tmp/build-bootstrap.log
           : > "$LOG"
-
           echo "==> ./scripts/run-docker.sh ./scripts/build-bootstraps.sh ${args[*]}"
           echo "==> 开始时间 $(date -u +%FT%TZ)"
-          # 后台守护：心跳 + **持续把容器内日志备份到宿主**
+
+          # ------------------------------------------------------------------
+          # 构建输出重定向到文件，**不实时刷到页面**。
           #
-          # 为什么必须持续备份，而不是最后再救：
-          #   Collect 步骤有多路救援（宿主 /tmp、docker cp、exec+tar、
-          #   docker logs），但它们全都依赖「容器还在、且里面文件还在」。
-          #   一旦容器在构建后被删除、或 runner 被回收，这些路会同时断，
-          #   到那时一点日志都拿不到 —— 而日志恰恰是唯一能用来修东西的东西。
+          # 之前用 `| tee -a "$LOG"` 实时输出，结果是几十万行逐行推到 Actions
+          # 日志里，页面直接卡死、翻都翻不动。所以改回重定向。
           #
-          #   所以把救援提前：构建一开始就起后台循环，每 60 秒从容器里
-          #   捞一次日志到宿主，形成滚动快照。即便最终容器消失，
-          #   宿主上也已有截至最后一分钟的内容。
+          # 代价是过程中看不到日志 —— 用下面的心跳补：每 3 分钟打一行
+          # 时间+行数+大小，足够判断「在跑 / 卡住 / 大概到哪了」，
+          # 而且只占几十字节，不会卡页面。
           #
-          # 循环里做三件事：
-          #   1. 备份：优先 docker cp（走 daemon，不受 bind 挂载权限限制），
-          #      失败退回 exec+tar 流（绕过 docker cp 对 mount 的限制）。
-          #   2. 心跳：打印时间戳与当前行数，行数长时间不变 = 卡住。
-          #   3. 备份失败也回显，便于判断是哪条路走不通。
-          #
-          # 用 -u 0 读容器文件：builder 写的日志宿主 uid 可能读不到。
+          # 完整日志在构建结束时一次性打印尾部 200 行（见下），
+          # 全文仍然完整落盘并随 artifact 上传，需要时去下载。
+          # ------------------------------------------------------------------
           SNAP=/tmp/build-bootstrap.snapshot.log
           : > "$SNAP"
 
-          guard_loop() {
-            while sleep 60; do
-              ts=$(date -u +%FT%TZ)
-              if ! docker cp "termux-package-builder:/home/builder/build-bootstrap.log" \
-                     "$SNAP" 2>/dev/null || [ ! -s "$SNAP" ]; then
-                if docker exec -u 0 termux-package-builder \
-                     tar -C /home/builder -cf - build-bootstrap.log 2>/dev/null \
-                     | tar -xf - -C /tmp 2>/dev/null && [ -s /tmp/build-bootstrap.log ]; then
-                  cp -f /tmp/build-bootstrap.log "$SNAP" 2>/dev/null || true
-                fi
-              fi
-              printf '[heartbeat %s] stream_lines=%s snapshot_lines=%s\n' \
-                "$ts" \
+          # 心跳：只打印统计，不搬内容
+          ( while sleep 180; do
+              printf '[heartbeat %s] lines=%s size=%s\n' \
+                "$(date -u +%FT%TZ)" \
                 "$(wc -l < "$LOG" 2>/dev/null || echo 0)" \
-                "$(wc -l < "$SNAP" 2>/dev/null || echo 0)"
-            done
-          }
-          guard_loop &
+                "$(wc -c < "$LOG" 2>/dev/null || echo 0)"
+            done ) &
           hb_pid=$!
 
+          # 后台持续备份：容器里那份日志也定期捞到宿主，
+          # 这样即便容器最终被删，宿主上仍有一份较新的副本。
+          # 与上面的心跳分开跑，避免搬运耗时影响心跳节奏。
+          ( while sleep 300; do
+              docker cp "termux-package-builder:/home/builder/build-bootstrap.log" \
+                "$SNAP" 2>/dev/null || true
+            done ) &
+          snap_pid=$!
+
+          # 无论怎么退出都收掉后台进程，避免留下僵尸循环
           final_sync() {
-            kill "$hb_pid" 2>/dev/null || true
-            wait "$hb_pid" 2>/dev/null || true
+            kill "$hb_pid" "$snap_pid" 2>/dev/null || true
+            wait "$hb_pid" "$snap_pid" 2>/dev/null || true
             docker cp "termux-package-builder:/home/builder/build-bootstrap.log" \
               "$SNAP" 2>/dev/null || true
-            if [ -s "$SNAP" ]; then
-              echo "==> snapshot lines $(wc -l < "$SNAP")"
-            else
-              echo "==> snapshot empty (no /home/builder/build-bootstrap.log in container)"
-            fi
           }
           trap final_sync EXIT INT TERM
 
-          ./scripts/run-docker.sh ./scripts/build-bootstraps.sh "${args[@]}" 2>&1 | tee -a "$LOG"
-          rc=${PIPESTATUS[0]}
+          # 核心：重定向，不 tee。
+          ./scripts/run-docker.sh ./scripts/build-bootstraps.sh "${args[@]}" > "$LOG" 2>&1
+          rc=$?
 
           final_sync
           trap - EXIT INT TERM
 
+          total_lines=$(wc -l < "$LOG" 2>/dev/null || echo 0)
+          total_size=$(wc -c < "$LOG" 2>/dev/null || echo 0)
           echo
-          echo "==> 结束时间 $(date -u +%FT%TZ)，退出码 $rc，日志 $(wc -l < "$LOG") 行"
+          echo "==> 结束时间 $(date -u +%FT%TZ) 退出码=$rc 日志=${total_lines}行/${total_size}字节"
+          echo "==> snapshot=$(wc -l < "$SNAP" 2>/dev/null || echo 0) 行"
+
+          # 只打印尾部，避免整本日志刷屏。全文见 artifact。
+          echo '===== 日志尾部 200 行 ====='
+          tail -200 "$LOG" 2>/dev/null || true
+          echo '===== 尾部结束 ====='
+
+          # 失败时把关键错误行单独拎出来，便于一眼定位
+          if [ "$rc" -ne 0 ]; then
+            echo
+            echo '===== 关键错误行 ====='
+            grep -nE 'ERROR|error:|Failed to (build|download)|No such file|Permission denied' "$LOG" 2>/dev/null \
+              | grep -vE 'error_|_error|errors?\.' | head -30 || echo '(无匹配)'
+          fi
 
           echo "BUILD_EXIT_CODE=$rc"
           echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
