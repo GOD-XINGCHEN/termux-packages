@@ -34,8 +34,17 @@ on:
         description: "目标架构，逗号分隔（aarch64,arm,i686,x86_64）"
         required: false
         default: "aarch64"
+      package_mode:
+        description: "构建模式：default=最小默认包集；list=读清单文件（对齐 v3 工具链）；custom=用下面手填的清单"
+        required: true
+        type: choice
+        options:
+          - list
+          - default
+          - custom
+        default: list
       add_packages:
-        description: "临时覆盖用的增包清单，逗号分隔。**留空即可** —— 默认读取 .github/bootstrap-add-packages.txt"
+        description: "仅 package_mode=custom 时生效。逗号分隔的包名，会完全替代清单文件"
         required: false
         default: ""
       download_retries:
@@ -146,6 +155,7 @@ jobs:
         # 等编译跑到一半才发现就是几十分钟白费。
         env:
           ADD_PACKAGES: ${{ inputs.add_packages }}
+          PACKAGE_MODE: ${{ inputs.package_mode }}
         run: |
           set -uo pipefail
           mapfile -t repos < <(jq -r 'del(.pkg_format) | keys | .[]' repo.json)
@@ -154,17 +164,32 @@ jobs:
           # 和 build 步骤用同一套逻辑取清单，避免两处不一致
           # （之前 preflight 只认 inputs，build 只认 env，两边校验的根本不是同一个集合）
           LIST_FILE=".github/bootstrap-add-packages.txt"
-          if [ -z "${ADD_PACKAGES:-}" ] && [ -f "$LIST_FILE" ]; then
-            ADD_PACKAGES=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$LIST_FILE" \
-                           | grep -v '^$' | awk '!seen[$0]++' | paste -sd, -)
-            echo "清单来源: $LIST_FILE"
-          elif [ -n "${ADD_PACKAGES:-}" ]; then
-            echo "清单来源: dispatch 输入（覆盖清单文件）"
-          else
-            echo "::warning::$LIST_FILE 不存在且无输入，跳过增包校验"
-            echo ADD_PACKAGES_OK
-            exit 0
-          fi
+          MODE="${PACKAGE_MODE:-list}"
+          echo "package_mode=$MODE"
+
+          case "$MODE" in
+            default)
+              echo "模式 default：使用 build-bootstraps.sh 自带包集，无增包"
+              echo ADD_PACKAGES_OK
+              exit 0
+              ;;
+            custom)
+              if [ -z "${ADD_PACKAGES:-}" ]; then
+                echo "::error::package_mode=custom 但 add_packages 为空"
+                exit 1
+              fi
+              echo "清单来源: dispatch 输入的 add_packages"
+              ;;
+            list|*)
+              if [ ! -f "$LIST_FILE" ]; then
+                echo "::error::package_mode=list 但 $LIST_FILE 不存在"
+                exit 1
+              fi
+              ADD_PACKAGES=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$LIST_FILE" \
+                             | grep -v '^$' | awk '!seen[$0]++' | paste -sd, -)
+              echo "清单来源: $LIST_FILE"
+              ;;
+          esac
           n=$(printf '%s' "$ADD_PACKAGES" | tr ',' '\n' | grep -c . || true)
           echo "待校验 $n 个包"
 
@@ -556,7 +581,9 @@ jobs:
           DL_RETRIES: ${{ inputs.download_retries }}
           DL_DELAY: ${{ inputs.download_retry_delay }}
           DL_MAX: ${{ inputs.download_retry_max }}
-          # dispatch 手填的增包清单；留空则回落 .github/bootstrap-add-packages.txt
+          # 构建模式：default / list / custom
+          PACKAGE_MODE_INPUT: ${{ inputs.package_mode }}
+          # 仅 custom 模式使用的增包清单
           ADD_PACKAGES_INPUT: ${{ inputs.add_packages }}
         run: |
           set +e
@@ -578,20 +605,24 @@ jobs:
           # 增删一个包都要改流水线，且 981 字符的单行串 diff 根本看不出改了啥。
           # ------------------------------------------------------------------
           LIST_FILE=".github/bootstrap-add-packages.txt"
-          ADD_LIST="${ADD_PACKAGES_INPUT:-}"
-          if [ -z "$ADD_LIST" ]; then
-            if [ -f "$LIST_FILE" ]; then
-              # 去掉注释和空行，去重，逗号拼接
-              ADD_LIST=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$LIST_FILE" \
-                         | grep -v '^$' | awk '!seen[$0]++' | paste -sd, -)
-              echo "==> 从 $LIST_FILE 读取增包清单"
-            else
-              echo "::warning::$LIST_FILE 不存在，将使用默认包集"
-              ADD_LIST=""
-            fi
-          else
-            echo "==> 使用 dispatch 输入的 add_packages 覆盖清单"
-          fi
+          MODE="${PACKAGE_MODE_INPUT:-list}"
+          ADD_LIST=""
+          case "$MODE" in
+            default)
+              echo "==> package_mode=default：纯默认包集，不加任何包"
+              ;;
+            custom)
+              ADD_LIST="${ADD_PACKAGES_INPUT:-}"
+              [ -n "$ADD_LIST" ] && echo "==> package_mode=custom：使用手填清单"
+              ;;
+            list|*)
+              if [ -f "$LIST_FILE" ]; then
+                ADD_LIST=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$LIST_FILE" \
+                           | grep -v '^$' | awk '!seen[$0]++' | paste -sd, -)
+                echo "==> package_mode=list：从 $LIST_FILE 读取"
+              fi
+              ;;
+          esac
           if [ -n "$ADD_LIST" ]; then
             n=$(printf '%s' "$ADD_LIST" | tr ',' '\n' | grep -c . || true)
             echo "==> --add $n packages"
