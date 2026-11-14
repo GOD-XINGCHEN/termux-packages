@@ -1,0 +1,159 @@
+name: Simulate log/artifact rescue
+
+# 在真 GitHub Runner + 真 Docker 上验证 bootstrap 工作流的救援逻辑。
+#
+# 为什么不本地模拟就够：本地只能桩替换 docker 命令，验证的是我们的 shell 分支；
+# 真 Runner 上能验证的是 Docker 本身的行为 —— 容器删了文件是否真丢、
+# docker cp 在容器停止后能否工作、exec -u 0 读 builder 写的文件是否成功。
+# 这些恰恰是救援逻辑的全部前提。
+#
+# 每个场景都复刻 Build step 的 guard_loop 与 Collect step 的救援顺序，
+# 只是把 build-bootstraps.sh 换成一个假脚本，几分钟跑完。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Setup fake builder container
+        run: |
+          set -euo pipefail
+          # 用 alpine 模拟 builder：以非 root 用户写日志，复现权限差异
+          docker run -d --name builder alpine:3.20 sleep 3600
+          docker exec -u 0 builder sh -c 'adduser -D -u 1001 builder'
+          echo "container up"
+          docker ps --format '{{.Names}} {{.Status}}'
+
+      - name: Scenario A -- container alive, tee present
+        run: |
+          set +e
+          cid=builder
+          rm -rf out && mkdir -p out
+          LOGNAME=build-aarch64-perf.log
+          LOGSRC=/home/builder/build-bootstrap.log
+          SNAP=/tmp/snapshot.log
+          LOG=/tmp/tee.log
+
+          # --- 模拟 Build：builder 写日志 + tee 落盘 ---
+          docker exec -u 0 $cid sh -c "mkdir -p /home/builder && echo 'built libllvm' > $LOGSRC"
+          echo 'tee copy' > $LOG
+
+          # --- 模拟 Collect ---
+          got=0
+          [ -s "$LOG" ] && { cp -f "$LOG" "out/$LOGNAME"; got=1; echo "log <- tee"; }
+          [ "$got" -eq 0 ] && [ -s "$SNAP" ] && { cp -f "$SNAP" "out/$LOGNAME"; got=1; echo "log <- snapshot"; }
+          [ "$got" -eq 0 ] && docker cp "$cid:$LOGSRC" "out/$LOGNAME" 2>/dev/null && [ -s "out/$LOGNAME" ] && { got=1; echo "log <- docker cp"; }
+
+          echo "got=$got content=$(cat out/$LOGNAME)"
+          [ "$got" -eq 1 ] && echo 'PASS A' || { echo 'FAIL A'; exit 1; }
+
+      - name: Scenario B -- tee lost, rolling snapshot rescues
+        run: |
+          set +e
+          cid=builder
+          rm -rf out && mkdir -p out
+          LOGNAME=build-aarch64-perf.log
+          LOGSRC=/home/builder/build-bootstrap.log
+          SNAP=/tmp/snapshot.log
+          LOG=/tmp/tee-missing.log
+
+          # 模拟 guard_loop 在构建中已成功备份一次
+          docker cp "$cid:$LOGSRC" "$SNAP" 2>/dev/null
+          echo "snapshot lines=$(wc -l < "$SNAP" 2>/dev/null || echo 0)"
+
+          # tee 文件不存在（模拟宿主 /tmp 被清）
+          rm -f "$LOG"
+
+          got=0
+          [ -s "$LOG" ] && { cp -f "$LOG" "out/$LOGNAME"; got=1; echo "log <- tee"; }
+          [ "$got" -eq 0 ] && [ -s "$SNAP" ] && { cp -f "$SNAP" "out/$LOGNAME"; got=1; echo "log <- snapshot"; }
+
+          echo "got=$got content=$(cat out/$LOGNAME 2>/dev/null)"
+          [ "$got" -eq 1 ] && echo 'PASS B' || { echo 'FAIL B'; exit 1; }
+
+      - name: Scenario C -- container removed, snapshot still works
+        run: |
+          set +e
+          rm -rf out && mkdir -p out
+          LOGNAME=build-aarch64-perf.log
+          SNAP=/tmp/snapshot.log
+          LOG=/tmp/tee-gone.log
+
+          # 关键场景：容器被删掉
+          docker rm -f builder >/dev/null 2>&1
+          echo "docker ps after rm:"; docker ps -a --format '{{.Names}}' || true
+
+          rm -f "$LOG"
+
+          got=0
+          [ -s "$LOG" ] && { cp -f "$LOG" "out/$LOGNAME"; got=1; echo "log <- tee"; }
+          [ "$got" -eq 0 ] && [ -s "$SNAP" ] && { cp -f "$SNAP" "out/$LOGNAME"; got=1; echo "log <- snapshot"; }
+          # 这两条此时必然失败，验证它们不会把已有结果清掉
+          [ "$got" -eq 0 ] && docker cp "builder:/home/builder/build-bootstrap.log" "out/$LOGNAME" 2>/dev/null && [ -s "out/$LOGNAME" ] && { got=1; echo "log <- docker cp"; }
+
+          echo "got=$got content=$(cat out/$LOGNAME 2>/dev/null)"
+          [ "$got" -eq 1 ] && echo 'PASS C' || { echo 'FAIL C'; exit 1; }
+
+      - name: Scenario D -- everything gone, diagnostic written
+        run: |
+          set +e
+          rm -rf out && mkdir -p out
+          LOGNAME=build-aarch64-perf.log
+          SNAP=/tmp/snapshot-empty.log
+          LOG=/tmp/tee-none.log
+
+          # 快照与 tee 都不存在（guard 从未抓到内容）
+          rm -f "$SNAP" "$LOG"
+
+          got=0
+          [ -s "$LOG" ] && { cp -f "$LOG" "out/$LOGNAME"; got=1; }
+          [ "$got" -eq 0 ] && [ -s "$SNAP" ] && { cp -f "$SNAP" "out/$LOGNAME"; got=1; }
+          [ "$got" -eq 0 ] && docker logs builder > "out/$LOGNAME" 2>&1 && [ -s "out/$LOGNAME" ] && got=1 || rm -f "out/$LOGNAME"
+
+          if [ "$got" -eq 0 ]; then
+            {
+              echo "build log missing (all rescue paths failed)"
+              echo "-- docker ps --"
+              docker ps -a 2>&1 | head -5 || true
+              echo "-- snapshot --"
+              [ -s "$SNAP" ] && echo "exists" || echo "empty -- guard loop never captured"
+            } > "out/$LOGNAME"
+            echo "diagnostic written"
+          fi
+
+          test -s "out/$LOGNAME" && echo 'PASS D' || { echo 'FAIL D'; exit 1; }
+          head -3 "out/$LOGNAME"
+
+      - name: Scenario E -- exec -u 0 reads builder-owned file
+        run: |
+          set +e
+          docker run -d --name builder2 alpine:3.20 sleep 600
+          docker exec -u 0 builder2 sh -c 'adduser -D -u 1001 builder && echo secret > /home/builder/f.txt && chown builder:builder /home/builder/f.txt && chmod 600 /home/builder/f.txt'
+          echo '-- file owned by uid 1001, mode 600 --'
+          docker exec -u 0 builder2 ls -l /home/builder/f.txt
+          echo '-- read as root via exec --'
+          docker exec -u 0 builder2 cat /home/builder/f.txt && echo 'PASS E' || echo 'FAIL E'
+          docker rm -f builder2 >/dev/null 2>&1
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Rescue simulation results"
+            echo ""
+            echo "| 场景 | 说明 |"
+            echo "|---|---|"
+            echo "| A | 容器在 + tee 在，tee 优先 |"
+            echo "| B | tee 丢，滚动快照救回 |"
+            echo "| C | 容器已删，快照仍可用（关键） |"
+            echo "| D | 全失败，写诊断而非空文件 |"
+            echo "| E | exec -u 0 能读 builder 的 600 文件 |"
+            echo ""
+            echo "详情见各 step 日志中的 PASS/FAIL 行。"
+          } >> "$GITHUB_STEP_SUMMARY"
