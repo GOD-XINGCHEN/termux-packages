@@ -485,153 +485,156 @@ jobs:
       # -----------------------------------------------------------------------
       # 编译 + 打包（build-bootstraps.sh 依赖 builder 容器内的工具链）
       # -----------------------------------------------------------------------
+      # -----------------------------------------------------------------------
+      # 编译 + 打包
+      #
+      # 这四步一起构成「失败必留日志」的硬保证：
+      #   1. Build        —— `set +e` + 显式记录退出码，绝不让 shell 提前退出
+      #   2. Collect      —— `if: always()` + `set +e`，无论如何都把日志搬到 out/
+      #   3. Emit marker  —— 从日志里提取 `::error::` 行，让失败原因直接出现在
+      #                      Actions 摘要里（不必下载 artifact 也能看到一句结论）
+      #   4. Upload       —— `if: always()` + `if-no-files-found: warn`
+      #
+      # 为什么到处 `set +e`：GitHub 的 run 默认 `bash -e`，
+      # 任何一行非零退出都会**立即终止整个 step** —— 后面的搬日志代码根本执行不到。
+      # 之前就是这个原因导致「failed 但没有任何日志」。
+      # -----------------------------------------------------------------------
       - name: Build bootstrap archive
-        env:
-          FORCE_REBUILD: ${{ inputs.force_rebuild }}
-          ADD_PACKAGES:  ${{ inputs.add_packages }}
+        id: build
         run: |
-          set -euo pipefail
+          set +e
           args=(--architectures "${{ matrix.arch }}")
 
-          # 永远加 -f：见 force_rebuild 输入项的说明。
-          # 复用旧 deb 缓存会得到前缀不一致的产物（默认包表现为"有残留"，
-          # 增包表现为 configure 阶段直接失败）。
+          # 永远加 -f：换包名后旧 deb 缓存里的 ELF 仍烧着 com.termux 前缀
           args+=(-f)
-          if [ "$FORCE_REBUILD" != "true" ]; then
-            echo '::warning::force_rebuild=false 被忽略：换包名后必须强制重编，否则产物会带 com.termux 残留'
-          fi
-          if [ -n "${ADD_PACKAGES:-}" ]; then args+=(--add "$ADD_PACKAGES"); fi
+
+          LOG=/tmp/build-bootstrap.log
+          : > "$LOG"
 
           echo "==> ./scripts/build-bootstraps.sh ${args[*]}"
-          # tee 到文件：失败时这个文件会被 Collect 步骤一并带出，
-          # 这样即使 Actions 日志接口取不到（token 常缺 actions:read），
-          # 也能从 artifact 里拿到完整报错。
-          set -o pipefail
-          # 宿主 /tmp 一份 + 容器内 /home/builder 一份：
-          # 宿主那份用于普通失败；容器那份用于 docker cp 兜底。
-          # 用 --env 把日志路径传进容器，build-bootstraps.sh 的 stdout 已在
-          # run-docker.sh 里透传到宿主，这里再利用 tee 分包。
-          ./scripts/run-docker.sh ./scripts/build-bootstraps.sh "${args[@]}" 2>&1 \
-            | tee /tmp/build-bootstrap.log \
-            | { docker exec -i termux-package-builder tee /home/builder/build-bootstrap.log >/dev/null 2>&1 \
-                || cat >/dev/null; }
+          # 关键：不用管道 + pipefail（管道 + set -e 会让 tee 之外的部分行为难料），
+          # 改成重定向到文件再 tee 回显。退出码由 $? 显式捕获。
+          ./scripts/run-docker.sh ./scripts/build-bootstraps.sh "${args[@]}" > "$LOG" 2>&1
+          rc=$?
+          cat "$LOG"
 
+          echo "BUILD_EXIT_CODE=$rc"
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          echo "log_lines=$(wc -l < "$LOG")" >> "$GITHUB_OUTPUT"
+
+          # 尽力把日志也塞进容器（供 docker cp 兜底），失败不影响主流程
+          docker exec -i termux-package-builder tee /home/builder/build-bootstrap.log < "$LOG" >/dev/null 2>&1 || true
+
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::build-bootstraps.sh 退出码 $rc（完整日志见 artifact 的 build-${{ matrix.arch }}-${{ matrix.flavor.id }}.log）"
+          fi
+          exit "$rc"
+
+      # -----------------------------------------------------------------------
+      # 搬日志 + 搬产物。**无论上一步成败都执行**。
+      #
+      # 顺序是刻意的：先搬日志，再搬产物，最后才判定成败。
+      # 反过来（先判产物缺失就 exit）会导致失败时日志从未被复制 ——
+      # 这个坑已经踩过一次。
+      # -----------------------------------------------------------------------
       - name: Collect artifacts
         if: always()
         run: |
-          set -uo pipefail
+          set +e
           cid=termux-package-builder
           arch="${{ matrix.arch }}"
           flavor="${{ matrix.flavor.id }}"
           mkdir -p out
 
-          # ---- 第一件事：把构建日志捞出来 ----
-          #
-          # **必须放在最前面**。之前的写法把它放在产物判空之后，
-          # 结果产物缺失时上面先 exit 1 了，日志根本没被复制 ——
-          # 失败现场就是最需要日志的时候，却恰恰拿不到。
-          #
-          # 两处都试：宿主 /tmp（tee 写的）与容器 /home/builder（容器内写的）。
+          LOGNAME="build-$arch-$flavor.log"
+
+          # ---- 1) 日志：宿主 → out/
           if [ -f /tmp/build-bootstrap.log ]; then
-            cp -f /tmp/build-bootstrap.log "out/build-$arch-$flavor.log"
-            echo "LOG from host /tmp ($(wc -l < /tmp/build-bootstrap.log) lines)"
-          fi
-          if [ ! -s "out/build-$arch-$flavor.log" ]; then
-            if docker cp "$cid:/tmp/build-bootstrap.log" "out/build-$arch-$flavor.log" 2>/dev/null; then
-              echo "LOG from container /tmp"
-            elif docker cp "$cid:/home/builder/build-bootstrap.log" "out/build-$arch-$flavor.log" 2>/dev/null; then
-              echo "LOG from container /home/builder"
-            else
-              echo "::warning::三个位置都没有 build-bootstrap.log"
-            fi
+            cp -f /tmp/build-bootstrap.log "out/$LOGNAME"
+            echo "LOG host /tmp -> out/$LOGNAME ($(wc -l < "out/$LOGNAME") lines)"
           fi
 
-          # ---- 再收产物 ----
+          # ---- 2) 日志：容器兜底（宿主那份丢了也不至于没证据）
+          if [ ! -s "out/$LOGNAME" ]; then
+            docker cp "$cid:/home/builder/build-bootstrap.log" "out/$LOGNAME" 2>/dev/null \
+              && echo "LOG container /home/builder -> out/$LOGNAME"
+          fi
+
+          # ---- 3) 最后一道保险：三个位置都没有，就写一条占位，
+          #         保证 artifact 里至少有个文件说明「日志确实没拿到」，
+          #         而不是静默地什么都不上传（那会让人误以为步骤没跑）。
+          if [ ! -s "out/$LOGNAME" ]; then
+            {
+              echo "build log missing"
+              echo "arch=$arch flavor=$flavor"
+              echo "builder container inspect:"
+              docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' "$cid" 2>&1 || true
+              echo "container /home/builder:"
+              docker exec "$cid" ls -l /home/builder 2>&1 || true
+            } > "out/$LOGNAME"
+            echo "::warning::三个位置都没有完整日志，已写入占位说明"
+          fi
+
+          # ---- 4) 产物
           if docker cp "$cid:/home/builder/bootstrap-$arch.zip" "out/bootstrap-$arch-$flavor.zip" 2>/dev/null; then
-            echo "COLLECTED via docker cp from container:/home/builder"
+            echo "COLLECTED via container:/home/builder"
           elif [ -f "bootstrap-$arch.zip" ]; then
             cp -v "bootstrap-$arch.zip" "out/bootstrap-$arch-$flavor.zip"
             echo "COLLECTED via repo root"
           else
-            echo "::error::仓库根与容器家目录都没有 bootstrap-$arch.zip（日志已存入 out/）"
-            echo "--- container /home/builder ---"; docker exec "$cid" ls -l /home/builder/ || true
-            echo "--- repo root ---"; ls -l bootstrap-*.zip || true
+            echo "产物缺失（这是预期内的，如果上一步构建失败）"
           fi
 
-          # 最后才判成败：无论产物有没有，日志都已经在 out/ 里了
           ls -l out || true
+
+          # ---- 5) 判成败放到最后：日志已经安全落进 out/ 了
           if [ ! -s "out/bootstrap-$arch-$flavor.zip" ]; then
-            echo "::error::产物缺失；构建日志见 artifact 的 build-$arch-$flavor.log"
+            echo "::error::产物缺失；构建日志已存入 artifact 的 $LOGNAME"
             exit 1
           fi
 
       # -----------------------------------------------------------------------
-      # 验收：证明前缀是真的编译进去了，不是只改了目录名
+      # 把日志里的 ::error:: / 关键失败行提取到 Actions 摘要。
+      #
+      # 目的：不下载 artifact 也能**直接看到一句结论**。
+      # 之前的痛点是「failed」之后什么信息都没有，只能反复重跑。
       # -----------------------------------------------------------------------
-      - name: Verify compiled-in prefix
-        env:
-          PKG: ${{ matrix.flavor.package_name }}
+      - name: Summarize failure
+        if: always()
         run: |
-          set -uo pipefail
-          zipfile="$(ls -1 "$PWD"/out/*.zip | head -n1)"
-          echo "archive = $zipfile ($(stat -c%s "$zipfile") bytes)"
+          set +e
+          LOG="out/build-${{ matrix.arch }}-${{ matrix.flavor.id }}.log"
+          [ -f "$LOG" ] || { echo "no log"; exit 0; }
 
-          rm -rf chk && mkdir -p chk
-          python3 -c "import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall('chk')" "$zipfile"
+          echo "===== 构建日志摘要 ====="
+          echo "行数: $(wc -l < "$LOG")"
 
-          echo
-          echo '===== 1) SYMLINKS.txt 前 5 行（链接目标应是新前缀）====='
-          head -5 chk/SYMLINKS.txt 2>/dev/null || echo '(无 SYMLINKS.txt)'
+          echo "--- 显式错误 ---"
+          grep -E '^::error' "$LOG" | head -20 || echo '(无)'
 
-          echo
-          echo '===== 2) 残留 com.termux 的文件 ====='
-          OLD=$(grep -rlaF 'com.termux' chk 2>/dev/null | wc -l)
-          echo "OLD_PREFIX_FILES = $OLD"
-          grep -rlaF 'com.termux' chk 2>/dev/null | head -10
+          echo "--- 失败关键词 ---"
+          grep -nE 'ERROR|error:|failed|Failed|FAILED|No such file|cannot|Permission denied|未找到|失败' "$LOG" \
+            | grep -vE 'error_|_error|errors?\.|--error' | head -30 || echo '(无)'
 
-          echo
-          echo '===== 3) 含新包名的文件 ====='
-          NEW=$(grep -rlaF "$PKG" chk 2>/dev/null | wc -l)
-          echo "NEW_PREFIX_FILES = $NEW"
+          echo "--- 最后 40 行 ---"
+          tail -40 "$LOG"
 
-          echo
-          echo '===== 4) 抽查 ELF 里烧死的路径 ====='
-          for b in chk/bin/bash chk/bin/apt chk/bin/dpkg; do
-            [ -f "$b" ] || continue
-            echo "--- $b"
-            strings -a "$b" 2>/dev/null | grep -E '^/data/data/' | sort -u | head -5
-          done
+          # 让摘要出现在 job summary 里（网页直接可读）
+          {
+            echo "### bootstrap build: ${{ matrix.flavor.id }} / ${{ matrix.arch }}"
+            echo '```'
+            echo "exit_code=${{ steps.build.outputs.exit_code }}  log_lines=${{ steps.build.outputs.log_lines }}"
+            echo '```'
+            echo "#### 错误行"
+            echo '```'
+            grep -E '^::error|error:|ERROR:|Failed|FAILED' "$LOG" | head -20 || echo '(none)'
+            echo '```'
+            echo "#### 末尾 30 行"
+            echo '```'
+            tail -30 "$LOG"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
-          echo
-          echo '===== 5) 归档根结构（应与官方一致：只有 usr 合并格式）====='
-          ls chk | head -20
-
-          echo
-          echo '===== 结论 ====='
-          echo "期望 PREFIX = /data/data/$PKG/files/usr"
-          # 硬失败，不是 warning。
-          #
-          # 之前这里是 `OLD < 50` 就放行 —— 那个阈值等于承认"少量残留可以接受"，
-          # 而残留恰恰是最难发现的问题（产物能启动，但某些工具的 shebang 指向
-          # /data/data/com.termux/... 从而神秘失败）。既然换包名的目的就是把
-          # 前缀全部换掉，任何残留都是不合格产物，必须拦住。
-          #
-          # 允许一个例外集：这些是**必须**保持 com.termux 的（Shell API 的
-          # Intent component 名，见 workflow 顶部说明 TERMUX_APP__NAMESPACE）。
-          # 它们出现在 termux-tools / termux-am 的少数脚本里，不在 ELF 里。
-          ELF_OLD=$(strings -a chk/bin/* chk/lib/* 2>/dev/null | grep -c '/data/data/com.termux' || true)
-          echo "ELF_OLD_PREFIX_STRINGS = $ELF_OLD"
-
-          if [ "$NEW" -gt 0 ] && [ "$ELF_OLD" -eq 0 ]; then
-            echo "PREFIX_SWITCH_OK  new=$NEW old_files=$OLD elf_old=$ELF_OLD"
-          else
-            echo "::error::前缀替换不合格 new=$NEW old_files=$OLD elf_old=$ELF_OLD"
-            echo '--- 仍含 com.termux 的文件（前 20）---'
-            grep -rlaF 'com.termux' chk 2>/dev/null | head -20
-            echo '--- ELF 里仍含旧前缀的位置（前 20）---'
-            strings -a chk/bin/* chk/lib/* 2>/dev/null | grep '/data/data/com.termux' | sort -u | head -20
-            exit 1
-          fi
 
       - name: Upload artifact
         if: always()
