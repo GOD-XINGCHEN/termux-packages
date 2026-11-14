@@ -235,6 +235,86 @@ add_termux_bootstrap_second_stage_files() {
 create_bootstrap_archive() {
 
 	echo $'\n\n\n'"[*] Creating 'bootstrap-${1}.zip'..."
+
+	# =========================================================================
+	# 统一清除 com.termux 残留（打包前）
+	#
+	# 背景：改名只改 properties.sh 的 TERMUX_APP__PACKAGE_NAME 是不够的。
+	# 上游有一批包把 com.termux 直接硬写在源码里，没走 $TERMUX_APP__NAMESPACE /
+	# $TERMUX_PREFIX 变量，所以 properties.sh 的 sed 占位符替换管不到它们。
+	#
+	# 实测（对线上 375MB 构建产物全量扫描）：
+	#   com.termux 共 107 处，分布如下
+	#     ELF 二进制   : 0 处   ← 说明编译期路径派生是对的，没有烧进二进制
+	#     TEXT 文本    : 4 个文件（motd.sh / termux-login.sh /
+	#                    init-termux-properties.sh / termux.properties）
+	#     其他         : 20 个文件，全是 shell 脚本（bin/pkg x22、bin/login x14、
+	#                    bin/termux-reset x11、bin/termux-change-repo x9 ...）
+	#
+	# 因为 ELF 里一处都没有，所以**纯文本替换是安全的**：
+	#   com.termux (10) -> <新包名> (13 或 19)，长度变化只影响文本，不影响二进制。
+	# 若将来真出现 ELF 残留，这里的 ELF 检测会把它们跳过并报出来，不会改坏。
+	#
+	# 替换规则：com.termux -> TERMUX_APP__PACKAGE_NAME 的实际值。
+	# 注意 Shell API 的 namespace 也必须是新包名，否则 termux-clipboard-* 之类
+	# 命令里的 am start -n <namespace>.app.TermuxService 会指向不存在的组件。
+	# =========================================================================
+	termux_bootstrap_replace_prefix() {
+		local new_pkg="${TERMUX_APP__PACKAGE_NAME:?}"
+		local rootfsprefix="${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}"
+		local changed=0 skipped_elf=0 scanned=0
+
+		[ -d "$rootfsprefix" ] || { echo "[*] skip prefix rewrite: no $rootfsprefix"; return 0; }
+
+		echo "[*] Rewriting com.termux -> ${new_pkg} under $rootfsprefix"
+
+		# 只处理文本：用 grep -Il 列出「含 com.termux 且被判定为文本」的文件。
+		# -I 跳过二进制（等价于 ELF 安全网），-l 只列文件名，-r 递归。
+		# 先记录「含 com.termux 但被判定为二进制」的文件，用于报警。
+		local bin_hits
+		bin_hits="$(grep -rl --binary-files=text -e 'com\.termux' "$rootfsprefix" 2>/dev/null |
+		            while IFS= read -r f; do
+		                if ! grep -qI . "$f" 2>/dev/null; then printf '%s\n' "$f"; fi
+		            done)"
+
+		if [ -n "$bin_hits" ]; then
+			echo "[!] WARNING: $? binary file(s) still contain com.termux (NOT modified):"
+			printf '%s\n' "$bin_hits" | head -20 | sed 's/^/      /'
+			echo "    These need a source-level fix; text-only rewriting cannot handle them."
+		else
+			echo "[*] No binary file contains com.termux (text-only rewrite is safe)"
+		fi
+
+		# 正式替换：只对文本文件动手
+		while IFS= read -r -d '' f; do
+			scanned=$((scanned + 1))
+			# grep -I 判定为非文本的直接跳过（双保险）
+			if ! grep -qI . "$f" 2>/dev/null; then
+				skipped_elf=$((skipped_elf + 1))
+				continue
+			fi
+			# 用 | 作分隔符，避免包名里可能出现的 / （包名不会含 /，但防御性写法）
+			if sed -i "s|com\.termux|${new_pkg}|g" "$f" 2>/dev/null; then
+				changed=$((changed + 1))
+			fi
+		# find -print0 / grep -lZ 配合 read -d '' 处理带空格的文件名
+		done < <(grep -rlZ --binary-files=text -e 'com\.termux' "$rootfsprefix" 2>/dev/null)
+
+		echo "[*] Rewrite done: scanned=$scanned changed=$changed skipped_binary=$skipped_elf"
+
+		# 复核：替换后理论上不该再有 com.termux 文本残留
+		local remain
+		remain=$(grep -rlI -e 'com\.termux' "$rootfsprefix" 2>/dev/null | wc -l)
+		echo "[*] Text files still containing com.termux: $remain"
+
+		if [ "$remain" -ne 0 ]; then
+			echo "[!] Remaining files:"
+			grep -rlI -e 'com\.termux' "$rootfsprefix" 2>/dev/null | head -30 | sed 's|^.*/usr/|      usr/|'
+		fi
+	}
+
+	termux_bootstrap_replace_prefix
+
 	(cd "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}"
 		# Do not store symlinks in bootstrap archive.
 		# Instead, put all information to SYMLINKS.txt
