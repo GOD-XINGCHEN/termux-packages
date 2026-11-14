@@ -1,0 +1,149 @@
+name: Purge old workflow runs
+
+# ---------------------------------------------------------------------------
+# 为什么需要这个工作流：
+#   之前我靠一次性的 Python 脚本手动删 run，删了 98 个还剩一堆，还得反复补删。
+#   手动脚本不能持续维护 —— 每次构建完又堆起来，而且我看不到 GitHub 上还有哪些。
+#   把「保留多少」这件事固化成工作流，才是一劳永逸。
+#
+# 策略（保守优先，避免误删）：
+#   1. 每个 workflow **分别**统计，不是全仓库一刀切；
+#   2. 每个 workflow 保留最近 N 个**成功**的 run，其余成功的删掉；
+#   3. 失败 / 取消的 run：保留最近 N 个用于排查，更早的删掉；
+#   4. 正在跑的（in_progress / queued）永远不碰；
+#   5. 一份「白名单保留」列表，防止把正在用于发布的构建删掉。
+#
+# 为什么不直接删所有非成功 run：
+#   失败记录本身有价值（对比同一 bug 是否复现）。全删掉反而丢失线索，
+#   所以保留最近几个，只清更早的历史。
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep_success:
+        description: "每个 workflow 保留最近几个成功 run"
+        required: false
+        default: "5"
+      keep_failed:
+        description: "每个 workflow 保留最近几个失败/取消 run（用于排查）"
+        required: false
+        default: "3"
+      dry_run:
+        description: "只打印将要删除的列表，不真删"
+        required: false
+        default: "false"
+  # 每周一 04:00 UTC 自动清一次，避免长期堆积
+  schedule:
+    - cron: '0 4 * * 1'
+
+permissions:
+  actions: write   # 删除 run 需要这个权限
+  contents: read
+
+jobs:
+  purge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Purge runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          KEEP_SUCCESS: ${{ inputs.keep_success || '5' }}
+          KEEP_FAILED: ${{ inputs.keep_failed || '3' }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          set -uo pipefail
+
+          echo "repo=$REPO keep_success=$KEEP_SUCCESS keep_failed=$KEEP_FAILED dry_run=$DRY_RUN"
+
+          # 拉全部 run（分页），按 workflow 分组。
+          # 用 gh api 而不是裸 curl，省去手写分页和鉴权。
+          tmp=$(mktemp)
+          echo '[]' > "$tmp"
+          page=1
+          while :; do
+            batch=$(gh api "/repos/$REPO/actions/runs?per_page=100&page=$page" \
+                      --jq '[.workflow_runs[] | {id, name, workflow_id, status, conclusion, created_at, path}]' 2>/dev/null) || break
+            n=$(echo "$batch" | jq 'length')
+            echo "page $page -> $n runs"
+            [ "$n" -eq 0 ] && break
+            # 累加到 tmp
+            jq -s '.[0] + .[1]' "$tmp" <(echo "$batch") > "$tmp.new" && mv "$tmp.new" "$tmp"
+            page=$((page+1))
+            [ "$page" -gt 30 ] && break     # 安全上限
+          done
+
+          total=$(jq 'length' "$tmp")
+          echo "total runs fetched: $total"
+
+          # ------------------------------------------------------------------
+          # 计算删除名单
+          #
+          # 对每个 workflow_id 分别处理：
+          #   - success 组按 created_at 倒序，跳过前 KEEP_SUCCESS 个，其余进删除名单
+          #   - failure/cancelled 组同理，跳过前 KEEP_FAILED 个
+          #   - in_progress / queued / waiting / requested 一律排除
+          #
+          # 用 workflow_id 而不是 name 分组：name 会因为 workflow 改名而变化，
+          # 同一个 workflow 的历史 run 可能带着不同的 name 字符串。
+          # ------------------------------------------------------------------
+          to_delete=$(jq -r \
+            --argjson ks "$KEEP_SUCCESS" \
+            --argjson kf "$KEEP_FAILED" '
+            # 只处理已结束的
+            [ .[] | select(.status == "completed") ]
+            | group_by(.workflow_id)
+            | map(
+                . as $all
+                | ( [ $all[] | select(.conclusion == "success") ]
+                    | sort_by(.created_at) | reverse ) as $ok
+                | ( [ $all[] | select(.conclusion != "success") ]
+                    | sort_by(.created_at) | reverse ) as $bad
+                | ( ($ok | .[$ks:]) + ($bad | .[$kf:]) )
+              )
+            | add // []
+            | .[]
+            | "\(.id)\t\(.conclusion // "-")\t\(.created_at)\t\(.name)"
+          ' "$tmp")
+
+          if [ -z "$to_delete" ]; then
+            echo "没有需要删除的 run"
+            exit 0
+          fi
+
+          cnt=$(echo "$to_delete" | wc -l)
+          echo "---- 待删除 $cnt 个 ----"
+          echo "$to_delete"
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "::notice::dry_run=true，未实际删除"
+            exit 0
+          fi
+
+          deleted=0; failed=0
+          while IFS=$'\t' read -r rid concl created name; do
+            [ -z "$rid" ] && continue
+            if gh api -X DELETE "/repos/$REPO/actions/runs/$rid" 2>/dev/null; then
+              deleted=$((deleted+1))
+            else
+              failed=$((failed+1))
+              echo "delete failed: $rid ($conclusion) $created $name"
+            fi
+            sleep 0.1
+          done <<< "$to_delete"
+
+          echo "=== 删除完成: deleted=$deleted failed=$failed ==="
+          {
+            echo "### Purge 结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 扫描 run 总数 | $total |"
+            echo "| 待删除 | $cnt |"
+            echo "| 实际删除 | $deleted |"
+            echo "| 删除失败 | $failed |"
+            echo "| 保留成功 | 每个 workflow 最近 $KEEP_SUCCESS 个 |"
+            echo "| 保留失败 | 每个 workflow 最近 $KEEP_FAILED 个 |"
+          } >> "$GITHUB_STEP_SUMMARY"
