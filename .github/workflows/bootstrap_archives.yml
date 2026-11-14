@@ -275,6 +275,146 @@ jobs:
           grep -n 'home/builder/bootstrap' scripts/build-bootstraps.sh
 
       # -----------------------------------------------------------------------
+      # 镜像源自动测速（宿主机 + builder 容器内）
+      #
+      # 为什么需要：编译期真正的下载发生在 **builder 容器内部** —— 每个包的
+      # build.sh 里写了源码 URL，大量指向 github.com 或上游站点。只在宿主机配
+      # git insteadOf 对容器**完全无效**：容器有自己的 HOME 与 /etc，宿主的
+      # ~/.gitconfig 不会被挂进去。
+      #
+      # 所以分两步：
+      #   1) Probe mirrors (host)：测 GitHub 镜像与 apt 源延迟，选出最快的一个，
+      #      宿主机配 git insteadOf，并把结果写进 step outputs。
+      #   2) Apply mirrors (container)：把同一结果注入 builder 容器
+      #      （git 写 builder 用户的 ~/.gitconfig，apt 改容器内 sources.list）。
+      #
+      # 为什么必须测速而不是写死镜像：不同 runner 出口位置不同，写死的镜像在
+      # 部分区域反而比直连慢；镜像本身也会挂。测速失败一律回退直连 ——
+      # 不能因为镜像不可用把整轮构建搞挂。
+      #
+      # 全部 continue-on-error：镜像只是加速手段，失败不该阻断构建。
+      # -----------------------------------------------------------------------
+      - name: Probe mirrors (host)
+        id: mirrors
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+
+          # 输出毫秒整数；请求失败给 999999（保证排在最后）
+          probe() {
+            local url="$1" t
+            t=$(curl -o /dev/null -s -w '%{time_total}' --max-time 6 --connect-timeout 4 "$url" 2>/dev/null || echo 999)
+            awk -v x="$t" 'BEGIN{ if (x+0 <= 0) x = 999; printf "%d", x * 1000 }'
+          }
+
+          echo '===== GitHub 镜像测速 ====='
+          GH_BEST='direct'; GH_BEST_MS=999999
+          try_gh() {
+            local id="$1" url="$2" ms
+            ms=$(probe "$url")
+            printf '%-14s %8s ms\n' "$id" "$ms"
+            if [ "$ms" -lt "$GH_BEST_MS" ]; then GH_BEST_MS="$ms"; GH_BEST="$id"; fi
+          }
+          try_gh direct       'https://github.com/termux/termux-packages/raw/master/README.md'
+          try_gh ghproxy.net  'https://ghproxy.net/https://github.com/termux/termux-packages/raw/master/README.md'
+          try_gh gh-proxy.com 'https://gh-proxy.com/https://github.com/termux/termux-packages/raw/master/README.md'
+          try_gh ghfast.top   'https://ghfast.top/https://github.com/termux/termux-packages/raw/master/README.md'
+          try_gh kkgithub     'https://raw.kkgithub.com/termux/termux-packages/master/README.md'
+          echo "GITHUB_BEST=$GH_BEST (${GH_BEST_MS} ms)"
+
+          echo
+          echo '===== apt 源测速 ====='
+          APT_BEST=''; APT_BEST_MS=999999
+          try_apt() {
+            local url="$1" ms
+            ms=$(probe "${url}dists/noble/Release")
+            printf '%-58s %8s ms\n' "$url" "$ms"
+            if [ "$ms" -lt "$APT_BEST_MS" ]; then APT_BEST_MS="$ms"; APT_BEST="$url"; fi
+          }
+          try_apt 'https://mirrors.tuna.tsinghua.edu.cn/ubuntu/'
+          try_apt 'https://mirrors.aliyun.com/ubuntu/'
+          try_apt 'https://mirrors.ustc.edu.cn/ubuntu/'
+          try_apt 'http://archive.ubuntu.com/ubuntu/'
+          # 全部超时则不写 apt 源（保持镜像自带配置）
+          if [ "$APT_BEST_MS" -eq 999999 ]; then APT_BEST=''; fi
+          echo "APT_BEST=${APT_BEST:-<none>} (${APT_BEST_MS} ms)"
+
+          # 宿主机 git 镜像（作用范围仅限本 workflow 自身的 git 操作）
+          case "$GH_BEST" in
+            ghproxy.net)  git config --global url."https://ghproxy.net/https://github.com/".insteadOf "https://github.com/" ;;
+            gh-proxy.com) git config --global url."https://gh-proxy.com/https://github.com/".insteadOf "https://github.com/" ;;
+            ghfast.top)   git config --global url."https://ghfast.top/https://github.com/".insteadOf "https://github.com/" ;;
+            kkgithub)     git config --global url."https://github.com/".insteadOf "https://raw.kkgithub.com/" ;;
+            *)            echo 'host git: 直连，不配置 insteadOf' ;;
+          esac
+
+          {
+            echo "gh_best=$GH_BEST"
+            echo "apt_best=$APT_BEST"
+          } >> "$GITHUB_OUTPUT"
+          echo MIRROR_PROBE_DONE
+
+      # -----------------------------------------------------------------------
+      # 把测速结果注入 builder 容器
+      #
+      # 容器信息来自 scripts/run-docker.sh：
+      #   : ${CONTAINER_NAME:=termux-package-builder}
+      #   CONTAINER_HOME_DIR=/home/builder
+      #   __change_builder_uid_gid 会把 builder 的 uid/gid 改成宿主 uid/gid
+      # 因此 git 配置必须写进 **builder 用户**的 ~/.gitconfig，不是 root 的。
+      #
+      # 三个必须这么写的细节：
+      #  1) 值通过 docker exec -e 传进去，不用宿主 shell 拼进命令串 ——
+      #     否则两层 shell 都会展开，URL 里的字符可能被二次解释。
+      #  2) sed 用 | 作分隔符，避免 URL 里的 / 冲突。
+      #  3) 不假设有 sudo：runner 上用户有 docker 组，run-docker.sh 的 SUDO 为空。
+      # -----------------------------------------------------------------------
+      - name: Apply mirrors (container)
+        continue-on-error: true
+        env:
+          GH_BEST: ${{ steps.mirrors.outputs.gh_best }}
+          APT_BEST: ${{ steps.mirrors.outputs.apt_best }}
+        run: |
+          set -uo pipefail
+          cid=termux-package-builder
+
+          if docker info >/dev/null 2>&1; then DOCKER='docker'; else DOCKER='sudo docker'; fi
+
+          if ! $DOCKER inspect "$cid" >/dev/null 2>&1; then
+            echo '::warning::builder 容器不存在，跳过容器内镜像配置'
+            exit 0
+          fi
+
+          case "${GH_BEST:-direct}" in
+            ghproxy.net)  MIRROR_URL='https://ghproxy.net/https://github.com/' ;;
+            gh-proxy.com) MIRROR_URL='https://gh-proxy.com/https://github.com/' ;;
+            ghfast.top)   MIRROR_URL='https://ghfast.top/https://github.com/' ;;
+            *)            MIRROR_URL='' ;;
+          esac
+
+          if [ -n "$MIRROR_URL" ]; then
+            $DOCKER exec -u builder -e "MU=$MIRROR_URL" "$cid" bash -lc '
+              git config --global "url.$MU.insteadOf" "https://github.com/"
+              git config --global --get-regexp "url\." || true
+            ' && echo "container git insteadOf -> $MIRROR_URL" \
+              || echo '::warning::容器内 git 配置失败（继续，只是不走镜像）'
+          else
+            echo 'container git: 直连（未配置 insteadOf）'
+          fi
+
+          if [ -n "${APT_BEST:-}" ]; then
+            $DOCKER exec -u root -e "APT=$APT_BEST" "$cid" bash -lc '
+              set -u
+              for f in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
+                [ -f "$f" ] && sed -i -E "s|https?://[a-z0-9.]*/ubuntu/?|$APT|g" "$f" 2>/dev/null || true
+              done
+              echo "container apt -> $APT"
+            ' || echo '::warning::容器内 apt 源改写失败（继续）'
+          fi
+
+          echo MIRROR_APPLY_DONE
+
+      # -----------------------------------------------------------------------
       # 编译 + 打包（build-bootstraps.sh 依赖 builder 容器内的工具链）
       # -----------------------------------------------------------------------
       - name: Build bootstrap archive
