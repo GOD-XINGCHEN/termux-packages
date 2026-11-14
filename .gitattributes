@@ -23,3 +23,9 @@
 # File syntax
 *.patch.beforehostbuild linguist-language=RAML
 *.patch.beforehostbuild linguist-language=Diff
+# Bootstrap opt/ 静态资源（dex2jar / Sources-AI-dexkit）
+# 这些是二进制分发文件，必须禁止换行转换，否则 .xz/.jar 会被改坏。
+termux-bootstrap-opt/** binary
+*.xz        binary
+*.jar       binary
+*.keystore  binary
