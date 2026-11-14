@@ -4,31 +4,38 @@
 #
 # 这是**唯一**需要修改的地方。增包 / 删包都只改这个文件，不要动 workflow。
 #
+# 构建模式由 workflow 的 package_mode 决定：
+#   default  纯默认包集，完全忽略本文件
+#   list     读本文件（默认）
+#   custom   用 dispatch 手填的 add_packages，忽略本文件
+#
 # 格式规则：
 #   - 每行一个包名
-#   - # 开头是注释，空行忽略
-#   - 行尾的 # 注释也支持（如：`clang   # Clang 编译器`）
-#   - 顺序无所谓，构建时按行序拼成 --add 参数
+#   - # 开头是注释，空行忽略；行尾 # 注释也支持
+#   - 重复项会自动去重
 #
-# 注意：--add 只接受**主包名**。子包（xxx.subpackage.sh）由父包自动带出，
-#       不能单独写在这里，否则 preflight 会报「不是合法包名」。
+# ★ 关键约束：--add 只接受**主包目录名**，也就是 packages/ 下真实存在的目录。
+#   命令名 ≠ 包名。几个容易踩的例子（preflight 会直接报错拦住）：
+#     clang / lld / llvm / libcompiler-rt  -> 都属于 libllvm 这一个包
+#     aapt2                                -> 由 aapt 包提供
+#     xxd                                  -> 由 vim 包提供
+#     libltdl                              -> 由 libtool 包提供
+#     libdw / libdebuginfod / elfutils     -> 上游已由 libdwarf 取代
+#     openssh-sftp-server                  -> openssh 的子包
 #
-# 这份清单的来源：把 Sources-AI-v3 里 bootstrap-aarch64.zip 的
-# var/lib/dpkg/status 与我们的构建逐包比对，得出 112 个「v3 有、我们没有」的包。
+#   改完清单后可以本地自查：把包名和 allpkgs.txt（git tree 导出的全部主包）比对。
+#
+# 本清单来源：把 Sources-AI-v3 的 bootstrap-aarch64.zip 里的
+# var/lib/dpkg/status 与我们的构建逐包比对，得到 112 个「v3 有、我们没有」的包，
+# 再按上面的主包规则归并。
 #   v3   : 221 packages / 27,820 files / 689 binaries / 539 MB
 #   我们 : 159 packages / 17,481 files / 423 binaries / 122 MB
-#
-# 增包时如果某个包依赖链上有源码站不可达，会重复之前 dash 的问题。
-# 处理办法见 scripts/build/termux_download.sh（已有 6 次指数退避重试）
-# 和 bootstrap_archives.yml 里的 src-mirror Release 机制。
 # =============================================================================
 
 # ---------- Clang / LLVM 工具链 ----------
-clang
+# 注意：下面四个都归到 libllvm 一个包，clang/lld/llvm/libcompiler-rt 是它的子包，
+# 写子包名会被 preflight 判为非法。
 libllvm
-lld
-llvm
-libcompiler-rt
 
 # ---------- NDK / 交叉编译 ----------
 ndk-sysroot
@@ -44,7 +51,6 @@ libresolv-wrapper
 apktool
 apksigner
 aapt
-aapt2
 d8
 dx
 dex2jar
@@ -53,15 +59,12 @@ procyon-decompiler
 
 # ---------- 调试 / 二进制分析 ----------
 gdb
-elfutils
+libdwarf
 libelf
-libdw
-libdebuginfod
 libthread-db
 strace
 ltrace
 radare2
-libasm
 
 # ---------- 网络 ----------
 aria2
@@ -69,7 +72,6 @@ dnsutils
 ldns
 nmap
 openssh
-openssh-sftp-server
 dropbear
 rsync
 wget
@@ -79,6 +81,7 @@ socat
 cmake
 ninja
 patchelf
+libtool
 
 # ---------- 运行时 / 语言 ----------
 nodejs-lts
@@ -106,16 +109,14 @@ tmux
 vim
 zsh
 zip
-xxd
 which
 hexedit
 xmlstarlet
 traceroute
 guile
 rhash
-lua54
 
-# ---------- 库依赖（多数是被上面某个包带出的，但 v3 里显式装了） ----------
+# ---------- 库依赖 ----------
 abseil-cpp
 alsa-lib
 alsa-plugins
@@ -133,7 +134,6 @@ libflac
 libgc
 libicu
 libjpeg-turbo
-libltdl
 libmicrohttpd
 libmp3lame
 libmpg123
