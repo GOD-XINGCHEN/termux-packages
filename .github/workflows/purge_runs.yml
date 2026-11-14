@@ -1,22 +1,49 @@
 name: Purge old workflow runs
 
-# ---------------------------------------------------------------------------
-# 为什么需要这个工作流：
-#   之前我靠一次性的 Python 脚本手动删 run，删了 98 个还剩一堆，还得反复补删。
-#   手动脚本不能持续维护 —— 每次构建完又堆起来，而且我看不到 GitHub 上还有哪些。
-#   把「保留多少」这件事固化成工作流，才是一劳永逸。
+# =============================================================================
+# 清理历史 run，控制 Actions 存储与页面噪音。
 #
-# 策略（保守优先，避免误删）：
-#   1. 每个 workflow **分别**统计，不是全仓库一刀切；
-#   2. 每个 workflow 保留最近 N 个**成功**的 run，其余成功的删掉；
-#   3. 失败 / 取消的 run：保留最近 N 个用于排查，更早的删掉；
-#   4. 正在跑的（in_progress / queued）永远不碰；
-#   5. 一份「白名单保留」列表，防止把正在用于发布的构建删掉。
+# -----------------------------------------------------------------------------
+# 策略
+# -----------------------------------------------------------------------------
+#   按 workflow **分别**统计（不是全仓库一刀切）：
+#     · 成功   保留最近 keep_success 个
+#     · 失败   保留最近 keep_failed 个
+#     · 取消   保留最近 keep_cancelled 个   <- 与失败分开计数
+#   其余删除。
 #
-# 为什么不直接删所有非成功 run：
-#   失败记录本身有价值（对比同一 bug 是否复现）。全删掉反而丢失线索，
-#   所以保留最近几个，只清更早的历史。
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 为什么取消要和失败分开计数
+# -----------------------------------------------------------------------------
+#   早期版本把 cancelled 和 failure 混在一个「非成功」组里共用 keep_failed
+#   名额。取消的 run 往往很多（重复派发、被 concurrency 顶掉、手动中止），
+#   会把真正有排查价值的失败记录挤出保留区。
+#
+#   构造数据实测：8 成功 + 3 取消 + 2 失败，keep_failed=3 时
+#   失败占掉 2 个名额，取消只剩 1 个被保留 —— 2 条取消记录被误删。
+#   两者性质完全不同，必须独立配额。
+#
+# -----------------------------------------------------------------------------
+# 为什么要有白名单文件
+# -----------------------------------------------------------------------------
+#   「保留哪些 run」是数据，不该写进工作流逻辑。
+#   清单在 .github/purge-keep-runs.txt，支持 run:<id> 与 workflow:<path>。
+#   早期版本的注释里写了「有白名单」，但代码里根本没实现 —— 这一版补上，
+#   并让注释与实现一致。
+#
+# -----------------------------------------------------------------------------
+# 为什么区分 404 与其他失败
+# -----------------------------------------------------------------------------
+#   删除 run 要求它所属的 workflow 文件仍然存在。历史临时 workflow 被删掉后，
+#   它们遗留的 run 无法通过 API 删除（永远 404）。把 404 当失败会让每周定时
+#   任务永久性刷红，真正的错误反而被淹没。所以 404 单独计数为 skipped。
+#
+# -----------------------------------------------------------------------------
+# 为什么分页要去重
+# -----------------------------------------------------------------------------
+#   翻页期间若有新 run 产生，后面的页会整体位移，同一个 run 可能在两页都出现。
+#   不去重会把它两次放进删除名单，第二次必然 404。
+# =============================================================================
 
 on:
   workflow_dispatch:
@@ -26,13 +53,18 @@ on:
         required: false
         default: "5"
       keep_failed:
-        description: "每个 workflow 保留最近几个失败/取消 run（用于排查）"
+        description: "每个 workflow 保留最近几个失败 run（用于排查）"
         required: false
         default: "3"
+      keep_cancelled:
+        description: "每个 workflow 保留最近几个取消 run（与失败分开计数）"
+        required: false
+        default: "2"
       dry_run:
         description: "只打印将要删除的列表，不真删"
         required: false
-        default: "false"
+        type: boolean
+        default: false
   # 每周一 04:00 UTC 自动清一次，避免长期堆积
   schedule:
     - cron: '0 4 * * 1'
@@ -41,100 +73,213 @@ permissions:
   actions: write   # 删除 run 需要这个权限
   contents: read
 
+# 同一时间只允许一个 purge 在跑：两个并发实例可能算出重叠的删除名单，
+# 后一个会对已被删掉的 run 发 DELETE，产生无意义的 404 噪音。
+concurrency:
+  group: purge-runs
+  cancel-in-progress: false
+
 jobs:
   purge:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      - name: Checkout (读取白名单)
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/purge-keep-runs.txt
+          sparse-checkout-cone-mode: false
+
       - name: Purge runs
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           KEEP_SUCCESS: ${{ inputs.keep_success || '5' }}
           KEEP_FAILED: ${{ inputs.keep_failed || '3' }}
+          KEEP_CANCELLED: ${{ inputs.keep_cancelled || '2' }}
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          KEEP_FILE: .github/purge-keep-runs.txt
         run: |
           set -uo pipefail
 
-          echo "repo=$REPO keep_success=$KEEP_SUCCESS keep_failed=$KEEP_FAILED dry_run=$DRY_RUN"
+          echo "repo=$REPO"
+          echo "keep_success=$KEEP_SUCCESS keep_failed=$KEEP_FAILED keep_cancelled=$KEEP_CANCELLED"
+          echo "dry_run=$DRY_RUN"
 
-          # 拉全部 run（分页），按 workflow 分组。
-          # 用 gh api 而不是裸 curl，省去手写分页和鉴权。
-          tmp=$(mktemp)
+          # ------------------------------------------------------------------
+          # 参数必须是正整数。--argjson 遇到 "abc" 会直接让 jq 报错，
+          # 但那时已经翻完所有页，白白浪费一轮 API 配额。
+          # ------------------------------------------------------------------
+          for v in "$KEEP_SUCCESS" "$KEEP_FAILED" "$KEEP_CANCELLED"; do
+            case "$v" in
+              ''|*[!0-9]*) echo "::error::保留数量必须是整数，收到 '$v'"; exit 1 ;;
+            esac
+          done
+
+          # ------------------------------------------------------------------
+          # 读白名单。文件不存在不算错（可能是刚 fork 的仓库）。
+          # ------------------------------------------------------------------
+          KEEP_IDS='[]'
+          KEEP_PATHS='[]'
+          if [ -f "$KEEP_FILE" ]; then
+            ids=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$KEEP_FILE" \
+                  | grep -E '^run:[0-9]+$' | cut -d: -f2 | paste -sd, -)
+            paths=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$KEEP_FILE" \
+                    | grep -E '^workflow:' | cut -d: -f2- | paste -sd, -)
+            [ -n "$ids" ]   && KEEP_IDS=$(printf '%s' "$ids"   | jq -R 'split(",") | map(tonumber)')
+            [ -n "$paths" ] && KEEP_PATHS=$(printf '%s' "$paths" | jq -R 'split(",")')
+            echo "白名单 run id : $KEEP_IDS"
+            echo "白名单 workflow: $KEEP_PATHS"
+          else
+            echo "::notice::$KEEP_FILE 不存在，白名单为空"
+          fi
+
+          # ------------------------------------------------------------------
+          # 翻页抓取全部 run，并按 id 去重。
+          #
+          # 用 gh api 而不是裸 curl：省去手写鉴权和分页头。
+          # 但要注意 gh api 失败时退出码非零，早期版本用 `|| break` 直接跳出，
+          # 结果是「限流导致只抓到第 1 页，然后安静地当成抓全了」。
+          # 这里改成：只要不是最后一页（返回 0 条）就报错退出。
+          # ------------------------------------------------------------------
+          tmp=$(mktemp); raw=$(mktemp)
           echo '[]' > "$tmp"
           page=1
           while :; do
-            batch=$(gh api "/repos/$REPO/actions/runs?per_page=100&page=$page" \
-                      --jq '[.workflow_runs[] | {id, name, workflow_id, status, conclusion, created_at, path}]' 2>/dev/null) || break
-            n=$(echo "$batch" | jq 'length')
+            if ! batch=$(gh api "/repos/$REPO/actions/runs?per_page=100&page=$page" \
+                           --jq '[.workflow_runs[] | {id, name, workflow_id, status, conclusion, created_at, path}]' 2>"$raw.err"); then
+              err=$(head -3 "$raw.err" 2>/dev/null)
+              echo "::error::第 $page 页抓取失败（限流或鉴权问题）：$err"
+              exit 1
+            fi
+            n=$(printf '%s' "$batch" | jq 'length')
             echo "page $page -> $n runs"
             [ "$n" -eq 0 ] && break
-            # 累加到 tmp
-            jq -s '.[0] + .[1]' "$tmp" <(echo "$batch") > "$tmp.new" && mv "$tmp.new" "$tmp"
+            printf '%s' "$batch" > "$raw"
+            # 按 id 去重后再累加，避免翻页位移导致重复
+            jq -s '.[0] + .[1] | unique_by(.id)' "$tmp" "$raw" > "$tmp.new" \
+              && mv "$tmp.new" "$tmp"
             page=$((page+1))
-            [ "$page" -gt 30 ] && break     # 安全上限
+            [ "$page" -gt 50 ] && { echo "::error::页数超过安全上限"; exit 1; }
           done
 
           total=$(jq 'length' "$tmp")
-          echo "total runs fetched: $total"
+          echo "total runs fetched (deduped): $total"
 
           # ------------------------------------------------------------------
-          # 计算删除名单
+          # 计算删除名单。
           #
-          # 对每个 workflow_id 分别处理：
-          #   - success 组按 created_at 倒序，跳过前 KEEP_SUCCESS 个，其余进删除名单
-          #   - failure/cancelled 组同理，跳过前 KEEP_FAILED 个
-          #   - in_progress / queued / waiting / requested 一律排除
+          # 分组键用 workflow_id 而不是 name：workflow 改名后同一 workflow 的
+          # 历史 run 会带着不同 name 串，按 name 分组会把一个 workflow 拆成两组，
+          # 导致每组都重新保留 N 个 —— 实际保留数翻倍。
           #
-          # 用 workflow_id 而不是 name 分组：name 会因为 workflow 改名而变化，
-          # 同一个 workflow 的历史 run 可能带着不同的 name 字符串。
+          # 三重保护，任一命中即不删：
+          #   1. status != completed  （在跑/排队的一律不碰）
+          #   2. id 在白名单
+          #   3. path 在白名单 workflow 里
           # ------------------------------------------------------------------
           to_delete=$(jq -r \
             --argjson ks "$KEEP_SUCCESS" \
-            --argjson kf "$KEEP_FAILED" '
-            # 只处理已结束的
+            --argjson kf "$KEEP_FAILED" \
+            --argjson kc "$KEEP_CANCELLED" \
+            --argjson keep_ids "$KEEP_IDS" \
+            --argjson keep_paths "$KEEP_PATHS" '
             [ .[] | select(.status == "completed") ]
+            | map(select(
+                (.id as $i | $keep_ids | index($i)) == null
+                and (.path as $p | $keep_paths | index($p)) == null
+              ))
             | group_by(.workflow_id)
             | map(
                 . as $all
                 | ( [ $all[] | select(.conclusion == "success") ]
                     | sort_by(.created_at) | reverse ) as $ok
-                | ( [ $all[] | select(.conclusion != "success") ]
+                | ( [ $all[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "startup_failure" or .conclusion == "action_required") ]
                     | sort_by(.created_at) | reverse ) as $bad
-                | ( ($ok | .[$ks:]) + ($bad | .[$kf:]) )
+                | ( [ $all[] | select(.conclusion == "cancelled" or .conclusion == "skipped" or .conclusion == "neutral" or .conclusion == "stale") ]
+                    | sort_by(.created_at) | reverse ) as $cxl
+                | ( ($ok | .[$ks:]) + ($bad | .[$kf:]) + ($cxl | .[$kc:]) )
               )
             | add // []
             | .[]
-            | "\(.id)\t\(.conclusion // "-")\t\(.created_at)\t\(.name)"
+            | "\(.id)\t\(.conclusion // "-")\t\(.created_at)\t\(.path)"
           ' "$tmp")
+
+          # 兜底：上面按 conclusion 分了三组，若有新的 conclusion 值（GitHub 会加新值）
+          # 没被任何组覆盖，那些 run 会永远不被清理且静默无感。这里显式查一次。
+          ungrouped=$(jq -r '
+            [ .[] | select(.status == "completed") ]
+            | map(select(
+                (.conclusion == "success")
+                or (.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "startup_failure" or .conclusion == "action_required")
+                or (.conclusion == "cancelled" or .conclusion == "skipped" or .conclusion == "neutral" or .conclusion == "stale")
+              ) | not)
+            | map(.conclusion) | unique | .[]
+          ' "$tmp")
+          if [ -n "$ungrouped" ]; then
+            echo "::warning::以下 conclusion 未被任何保留组覆盖，其 run 不会被清理：$ungrouped"
+          fi
 
           if [ -z "$to_delete" ]; then
             echo "没有需要删除的 run"
+            {
+              echo "### Purge 结果"
+              echo ""
+              echo "| 项 | 值 |"
+              echo "|---|---|"
+              echo "| 扫描 run 总数 | $total |"
+              echo "| 待删除 | 0 |"
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
-          cnt=$(echo "$to_delete" | wc -l)
+          cnt=$(printf '%s\n' "$to_delete" | grep -c . || true)
           echo "---- 待删除 $cnt 个 ----"
-          echo "$to_delete"
+          printf '%s\n' "$to_delete"
 
           if [ "$DRY_RUN" = "true" ]; then
-            echo "::notice::dry_run=true，未实际删除"
+            echo "::notice::dry_run=true，未实际删除（上面是完整名单）"
+            {
+              echo "### Purge 结果（dry run）"
+              echo ""
+              echo "| 项 | 值 |"
+              echo "|---|---|"
+              echo "| 扫描 run 总数 | $total |"
+              echo "| 待删除（未执行） | $cnt |"
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
-          deleted=0; failed=0
-          while IFS=$'\t' read -r rid concl created name; do
+          # ------------------------------------------------------------------
+          # 逐个删除。区分三种结果：
+          #   deleted  真的删掉了
+          #   skipped  404 —— workflow 文件已不存在，永远删不掉，不算错误
+          #   failed   其他错误（权限、5xx），算错误
+          # ------------------------------------------------------------------
+          deleted=0; skipped=0; failed=0
+          failed_ids=''
+          while IFS=$'\t' read -r rid concl created path; do
             [ -z "$rid" ] && continue
-            if gh api -X DELETE "/repos/$REPO/actions/runs/$rid" 2>/dev/null; then
+            if out=$(gh api -X DELETE "/repos/$REPO/actions/runs/$rid" 2>&1); then
               deleted=$((deleted+1))
             else
-              failed=$((failed+1))
-              echo "delete failed: $rid ($conclusion) $created $name"
+              case "$out" in
+                *404*|*"Not Found"*)
+                  skipped=$((skipped+1))
+                  echo "skip(404): $rid ($concl) $path"
+                  ;;
+                *)
+                  failed=$((failed+1))
+                  failed_ids="$failed_ids $rid"
+                  echo "::warning::delete failed: $rid ($concl) $path -- $(printf '%s' "$out" | head -1)"
+                  ;;
+              esac
             fi
-            sleep 0.1
+            sleep 0.15
           done <<< "$to_delete"
 
-          echo "=== 删除完成: deleted=$deleted failed=$failed ==="
+          echo "=== 完成: deleted=$deleted skipped(404)=$skipped failed=$failed ==="
+
           {
             echo "### Purge 结果"
             echo ""
@@ -143,7 +288,19 @@ jobs:
             echo "| 扫描 run 总数 | $total |"
             echo "| 待删除 | $cnt |"
             echo "| 实际删除 | $deleted |"
+            echo "| 跳过（404，workflow 已不存在） | $skipped |"
             echo "| 删除失败 | $failed |"
-            echo "| 保留成功 | 每个 workflow 最近 $KEEP_SUCCESS 个 |"
-            echo "| 保留失败 | 每个 workflow 最近 $KEEP_FAILED 个 |"
+            echo "| 保留成功 | 每 workflow 最近 $KEEP_SUCCESS 个 |"
+            echo "| 保留失败 | 每 workflow 最近 $KEEP_FAILED 个 |"
+            echo "| 保留取消 | 每 workflow 最近 $KEEP_CANCELLED 个 |"
+            echo ""
+            echo "白名单：\`$KEEP_FILE\`（run id: \`$KEEP_IDS\`, workflow: \`$KEEP_PATHS\`）"
           } >> "$GITHUB_STEP_SUMMARY"
+
+          # 只有真正的删除错误才让 job 变红。
+          # 404 是这类 run 的必然归宿（workflow 文件已删），不该长期刷红。
+          if [ "$failed" -gt 0 ]; then
+            echo "::error::$failed 个 run 删除失败:$failed_ids"
+            exit 1
+          fi
+          echo PURGE_OK
