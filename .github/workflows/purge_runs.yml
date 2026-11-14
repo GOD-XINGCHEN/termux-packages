@@ -14,12 +14,28 @@ name: Purge old workflow runs
 #
 #   所以策略是：
 #     · failure / cancelled / skipped / timed_out / ...  -> 全部删除
-#     · success                                          -> 只留最近 keep_success 个
+#     · success                                          -> 只留最近 N 个，N 按 workflow 分别配置
 #     · 正在运行 / 排队                                   -> 永不触碰
 #
 #   早期版本把「失败保留 3 个以便排查」当默认，方向就错了：
 #   失败日志已存进 artifact，排查靠那次日志，不是 run 记录本身。
 #   保留一堆失败 run 只是把 Actions 页面刷红。
+#
+# -----------------------------------------------------------------------------
+# 保留数量必须按 workflow 分别设置
+# -----------------------------------------------------------------------------
+#   「成功」对不同 workflow 的含义完全不同：
+#
+#     bootstrap_archives.yml  一次成功 = 一轮几小时的编译并产出 bootstrap 包，
+#                             保留最近几次以便对照构建历史，有意义。
+#
+#     purge_runs.yml          这个 workflow 的工作就是清理历史。它自己的每条 run
+#                             都是纯维护动作：没有产物、不代表任何构建结果、
+#                             没有复盘价值。成功也该删，一条不留。
+#
+#   早期版本给所有 workflow 套同一个 keep_success=3，结果是 purge 永远清不掉
+#   自己 —— 每跑一次就留一条成功记录，越清越多。
+#   现在保留数写在 .github/purge-scope.txt 每行的 keep= 上。
 #
 # -----------------------------------------------------------------------------
 # 只清理我们自己的 workflow
@@ -50,10 +66,6 @@ name: Purge old workflow runs
 on:
   workflow_dispatch:
     inputs:
-      keep_success:
-        description: "每个 workflow 保留最近几个成功 run（失败/取消/跳过一律全删）"
-        required: false
-        default: "3"
       dry_run:
         description: "只打印将要删除的列表，不真删"
         required: false
@@ -89,19 +101,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          KEEP_SUCCESS: ${{ inputs.keep_success || '3' }}
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
           SCOPE_FILE: .github/purge-scope.txt
           KEEP_FILE: .github/purge-keep-runs.txt
         run: |
           set -uo pipefail
-
           echo "repo=$REPO"
-          echo "keep_success=$KEEP_SUCCESS dry_run=$DRY_RUN"
+          echo "dry_run=$DRY_RUN"
 
-          case "$KEEP_SUCCESS" in
-            ''|*[!0-9]*) echo "::error::keep_success 必须是整数，收到 '$KEEP_SUCCESS'"; exit 1 ;;
-          esac
 
           # ------------------------------------------------------------------
           # 读管辖范围。这是安全边界：读不到就不干活，绝不默认「全部 workflow」。
@@ -111,17 +118,48 @@ jobs:
             echo "::error::$SCOPE_FILE 不存在。拒绝在没有范围限制的情况下清理仓库。"
             exit 1
           fi
-          scope=$(awk '
-            { line = $0; sub(/#.*/, "", line); gsub(/[[:space:]]/, "", line) }
-            line ~ /^workflow:/ { print substr(line, 10) }
-          ' "$SCOPE_FILE" | paste -sd, -)
+          # 每行形如：workflow:<path> keep=<N>
+          # keep= 可省略，省略时用 DEFAULT_KEEP。
+          # 解析结果是一个 JSON 对象 {path: keep}，算删除名单时按 path 查各自保留数。
+          #
+          # 用 awk 而不是 grep/sed：注释行很多，无匹配时必须返回 0，
+          # 否则 GitHub Actions 默认的 -e 会直接杀掉整个 step。
+          DEFAULT_KEEP=3
 
-          if [ -z "$scope" ]; then
+          scope_rows=$(awk -v def="$DEFAULT_KEEP" '
+            {
+              line = $0
+              sub(/#.*/, "", line)
+              gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+              if (line !~ /^workflow:/) next
+              keep = def
+              if (match(line, /keep=[0-9]+/)) {
+                keep = substr(line, RSTART + 5, RLENGTH - 5)
+                line = substr(line, 1, RSTART - 1)
+                gsub(/[[:space:]]+$/, "", line)
+              }
+              path = substr(line, 10)
+              gsub(/[[:space:]]+/, "", path)
+              if (path != "") printf "%s\t%s\n", path, keep
+            }
+          ' "$SCOPE_FILE")
+
+          if [ -z "$scope_rows" ]; then
             echo "::error::$SCOPE_FILE 里没有任何 workflow: 条目，拒绝执行"
             exit 1
           fi
-          SCOPE_JSON=$(printf '%s' "$scope" | jq -R 'split(",")')
-          echo "管辖范围: $SCOPE_JSON"
+
+          # {".github/workflows/x.yml": 3, ...}
+          SCOPE_MAP=$(printf '%s\n' "$scope_rows" | jq -R -s '
+            split("\n")
+            | map(select(length > 0) | split("\t"))
+            | map({key: .[0], value: (.[1] | tonumber)})
+            | from_entries
+          ')
+          echo "管辖范围与保留数: $SCOPE_MAP"
+
+          # 仅路径数组，用于筛选「是否属于管辖范围」
+          SCOPE_JSON=$(printf '%s' "$SCOPE_MAP" | jq 'keys')
 
           # ------------------------------------------------------------------
           # 读白名单（可选）
@@ -179,16 +217,15 @@ jobs:
           #   3. id 不在白名单
           #
           # 然后分两组：
-          #   ok   成功  -> 保留最近 keep_success 个，其余删
+          #   ok   成功  -> 保留最近 N 个（N = 该 workflow 在 scope 文件里的 keep=）
           #   bad  其余  -> 全删（失败/取消/跳过都是白跑一轮，没有保留价值）
           # ------------------------------------------------------------------
           to_delete=$(jq -r \
-            --argjson ks "$KEEP_SUCCESS" \
-            --argjson keep_ids "$KEEP_IDS" \
-            --argjson scope "$SCOPE_JSON" '
+            --argjson keep_map "$SCOPE_MAP" \
+            --argjson keep_ids "$KEEP_IDS" '
             [ .[]
               | select(.status == "completed")
-              | select(.path as $p | any($scope[]; . == $p))
+              | select(.path as $p | $keep_map | has($p))
               | select(.id as $i | (any($keep_ids[]; . == $i) | not))
             ]
             | group_by(.workflow_id)
@@ -198,6 +235,8 @@ jobs:
                     | sort_by(.created_at) | reverse ) as $ok
                 | ( [ $all[] | select(.conclusion != "success") ]
                     | sort_by(.created_at) | reverse ) as $bad
+                # 各自的保留数：查 purge-scope.txt 里该 workflow 的 keep=
+                | ( ($all[0].path) as $p | $keep_map[$p] ) as $ks
                 | ( ($ok | .[$ks:]) + $bad )
               )
             | add // []
@@ -229,7 +268,7 @@ jobs:
           fi
 
           cnt=$(printf '%s\n' "$to_delete" | grep -c . || true)
-          echo "---- 待删除 $cnt 个（失败/取消/跳过全删，成功只留最近 $KEEP_SUCCESS 个）----"
+          echo "---- 待删除 $cnt 个（失败/取消/跳过全删；成功按各 workflow 的 keep= 保留）----"
           printf '%s\n' "$to_delete"
 
           if [ "$DRY_RUN" = "true" ]; then
@@ -289,7 +328,7 @@ jobs:
             echo "| 实际删除 | $deleted |"
             echo "| 跳过（404） | $skipped |"
             echo "| 删除失败 | $failed |"
-            echo "| 保留策略 | 成功留最近 $KEEP_SUCCESS 个；失败/取消/跳过全删 |"
+            echo "| 保留策略 | 失败/取消/跳过全删；成功按 purge-scope.txt 的 keep= 保留 |"
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$failed" -gt 0 ]; then
