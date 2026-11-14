@@ -507,7 +507,13 @@ jobs:
           # 这样即使 Actions 日志接口取不到（token 常缺 actions:read），
           # 也能从 artifact 里拿到完整报错。
           set -o pipefail
-          ./scripts/run-docker.sh ./scripts/build-bootstraps.sh "${args[@]}" 2>&1 | tee /tmp/build-bootstrap.log
+          # 宿主 /tmp 一份 + 容器内 /home/builder 一份：
+          # 宿主那份用于普通失败；容器那份用于 docker cp 兜底。
+          # 用 --env 把日志路径传进容器，build-bootstraps.sh 的 stdout 已在
+          # run-docker.sh 里透传到宿主，这里再利用 tee 分包。
+          ./scripts/run-docker.sh ./scripts/build-bootstraps.sh "${args[@]}" 2>&1 \
+            | tee /tmp/build-bootstrap.log \
+            | docker exec -i termux-package-builder tee /home/builder/build-bootstrap.log >/dev/null || true
 
       - name: Collect artifacts
         if: always()
@@ -518,30 +524,45 @@ jobs:
           flavor="${{ matrix.flavor.id }}"
           mkdir -p out
 
-          # 主路径：产物在容器家目录 /home/builder（builder 拥有、非 bind 挂载、可写）。
-          # 用 docker cp 经 daemon 取出，绕开容器写不进 bind 目录的限制。
+          # ---- 第一件事：把构建日志捞出来 ----
+          #
+          # **必须放在最前面**。之前的写法把它放在产物判空之后，
+          # 结果产物缺失时上面先 exit 1 了，日志根本没被复制 ——
+          # 失败现场就是最需要日志的时候，却恰恰拿不到。
+          #
+          # 两处都试：宿主 /tmp（tee 写的）与容器 /home/builder（容器内写的）。
+          if [ -f /tmp/build-bootstrap.log ]; then
+            cp -f /tmp/build-bootstrap.log "out/build-$arch-$flavor.log"
+            echo "LOG from host /tmp ($(wc -l < /tmp/build-bootstrap.log) lines)"
+          fi
+          if [ ! -s "out/build-$arch-$flavor.log" ]; then
+            if docker cp "$cid:/tmp/build-bootstrap.log" "out/build-$arch-$flavor.log" 2>/dev/null; then
+              echo "LOG from container /tmp"
+            elif docker cp "$cid:/home/builder/build-bootstrap.log" "out/build-$arch-$flavor.log" 2>/dev/null; then
+              echo "LOG from container /home/builder"
+            else
+              echo "::warning::三个位置都没有 build-bootstrap.log"
+            fi
+          fi
+
+          # ---- 再收产物 ----
           if docker cp "$cid:/home/builder/bootstrap-$arch.zip" "out/bootstrap-$arch-$flavor.zip" 2>/dev/null; then
             echo "COLLECTED via docker cp from container:/home/builder"
-          # 回退：容器→仓库根的 mv 若成功（本地/非隔离 runner），产物就在仓库根
           elif [ -f "bootstrap-$arch.zip" ]; then
             cp -v "bootstrap-$arch.zip" "out/bootstrap-$arch-$flavor.zip"
             echo "COLLECTED via repo root"
           else
-            echo "::error::仓库根与容器家目录都没有 bootstrap-$arch.zip"
+            echo "::error::仓库根与容器家目录都没有 bootstrap-$arch.zip（日志已存入 out/）"
             echo "--- container /home/builder ---"; docker exec "$cid" ls -l /home/builder/ || true
             echo "--- repo root ---"; ls -l bootstrap-*.zip || true
-            exit 1
           fi
 
-          # 日志一并带出（失败时最需要它）
-          cp -f /tmp/build-bootstrap.log "out/build-$arch-$flavor.log" 2>/dev/null || true
-
+          # 最后才判成败：无论产物有没有，日志都已经在 out/ 里了
+          ls -l out || true
           if [ ! -s "out/bootstrap-$arch-$flavor.zip" ]; then
-            echo "::error::产物为空，构建日志见 artifact 里的 build-$arch-$flavor.log"
-            ls -l out || true
+            echo "::error::产物缺失；构建日志见 artifact 的 build-$arch-$flavor.log"
             exit 1
           fi
-          ls -l out
 
       # -----------------------------------------------------------------------
       # 验收：证明前缀是真的编译进去了，不是只改了目录名
