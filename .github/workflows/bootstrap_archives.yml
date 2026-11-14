@@ -1,71 +1,375 @@
-name: Generate bootstrap archives (android-7)
+name: Bootstrap archives (custom package name, from source)
+
+# =============================================================================
+# 目的：从源码编译 Termux bootstrap，把编译期前缀里的包名从 com.termux 换成
+#       自己的（debug / perf 各一份）。
+#
+# 唯一变量：scripts/properties.sh 的 TERMUX_APP__PACKAGE_NAME
+#   改这一个常量，下面整条链自动派生（properties.sh 原样逻辑，不动结构）：
+#
+#     TERMUX_APP__PACKAGE_NAME = me.sources.ai.debug        (L467)
+#       TERMUX_APP__DATA_DIR   = /data/data/<pkg>           (L488)
+#         TERMUX__ROOTFS       = <DATA_DIR>/files           (L786)
+#           TERMUX__PREFIX     = <ROOTFS>/usr               (L947)
+#                              = /data/data/me.sources.ai.debug/files/usr
+#
+#   TERMUX_APP__NAMESPACE 保持 com.termux 不动 —— 它只决定 Shell API 的
+#   Intent component 名，不参与任何路径派生，改它反而会让 am/rfcomm 调不到。
+#
+# 为什么必须 build-bootstraps.sh（真编译），不能用官方 generate-bootstraps.sh：
+#   generate-bootstraps.sh 只是从 packages-cf.termux.dev 下载上游【已编译好的】
+#   .deb 再重打包。ELF 的 DT_RUNPATH、脚本 shebang 里的 /data/data/com.termux/...
+#   都是编译期烧死的常量，改 properties.sh 对这些 .deb 无效。
+#   要换前缀必须走 build-package.sh，让 $TERMUX_PREFIX 参与 configure/make。
+#
+# 产物使用前提：
+#   App 侧（Sources-AI-v3 的 TermuxBootstrap.kt / TermuxShell.kt）里写死的
+#   prefix 常量必须与这里选的包名一致，否则 bootstrap 找不到自己的 $PREFIX。
+# =============================================================================
 
 on:
-  schedule:
-    - cron: "0 0 * * 0"
   workflow_dispatch:
+    inputs:
+      architectures:
+        description: "目标架构，逗号分隔（aarch64,arm,i686,x86_64）"
+        required: false
+        default: "aarch64"
+      add_packages:
+        description: "额外打入 bootstrap 的包，逗号分隔（可留空）"
+        required: false
+        default: ""
+      force_rebuild:
+        description: "强制重编（-f）。全新 runner 无缓存时不需要"
+        required: false
+        type: boolean
+        default: false
 
-permissions: {} # none
+permissions:
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build:
-    permissions:
-      contents: read # actions/upload-artifact doesn't need contents: write
-    runs-on: ubuntu-slim
-    strategy:
-      matrix:
-        arch:
-          - aarch64
-          - arm
-          - i686
-          - x86_64
-    if: github.repository == 'termux/termux-packages'
+
+  # ---------------------------------------------------------------------------
+  # 1. 生成矩阵：flavor（一个包名）× arch（一个架构）
+  #    一个 flavor = 一次完整编译。包名清单只改下面 flavors 数组。
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: prepare matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
-      - name: Git clone
-        uses: actions/checkout@v7
-      - name: Create bootstrap archive
-        run: ./scripts/generate-bootstraps.sh --architectures ${{ matrix.arch }}
-      - name: Store artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: bootstrap-archives-${{ matrix.arch }}-${{ github.sha }}
-          path: "*.zip"
-  publish:
-    permissions:
-      contents: write # for git push
-    needs: build
-    runs-on: ubuntu-slim
-    steps:
-      - name: Git clone
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - name: Fetch bootstrap archives
-        uses: actions/download-artifact@v8
-        with:
-          merge-multiple: true
-          path: ./
-      - name: Create new tag
-        id: get_tag
-        run: |
-          new_tag="bootstrap-$(date "+%Y.%m.%d")"
-          existing_tag_revision=$(git tag | grep "$new_tag" | sort -r | head -n 1 | cut -d- -f3 | cut -dr -f2)
-          if [ -n "$existing_tag_revision" ]; then
-            tag_rev=$((existing_tag_revision + 1))
-          else
-            tag_rev=1
-          fi
-          new_tag="${new_tag}-r${tag_rev}+apt.android-7"
-          echo "tag_name=$new_tag" >> $GITHUB_OUTPUT
-      - name: Publish bootstrap zips to GitHub release
+      - name: Build matrix
+        id: matrix
         env:
-          GH_TOKEN: ${{ github.token }}
+          ARCHITECTURES: ${{ inputs.architectures || 'aarch64' }}
         run: |
-          gh release create ${{ steps.get_tag.outputs.tag_name }} --title "Bootstrap archives for Termux application (apt.android-7)"
-          for file in *.zip; do
-            gh release upload ${{ steps.get_tag.outputs.tag_name }} "$file"
+          set -euo pipefail
+
+          # ---- 包名定义（与 app/build.gradle.kts 对齐）-----------------------
+          #   debug buildType : applicationId = me.sources.ai + ".debug"
+          #   perf  buildType : applicationId = me.sources.ai
+          flavors='[
+            {"id":"debug","package_name":"me.sources.ai.debug"},
+            {"id":"perf", "package_name":"me.sources.ai"}
+          ]'
+          # ------------------------------------------------------------------
+
+          archs="$(printf '%s' "$ARCHITECTURES" | tr -d ' ' | tr ',' '\n' | jq -R . | jq -s -c .)"
+          echo "architectures = $archs"
+
+          matrix="$(jq -n -c --argjson f "$flavors" --argjson a "$archs" '{flavor:$f, arch:$a}')"
+          echo "matrix = $matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 2. 编译
+  # ---------------------------------------------------------------------------
+  build:
+    name: ${{ matrix.flavor.id }} / ${{ matrix.arch }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Environment info
+        run: |
+          set -x
+          docker version
+          df -h /
+
+      # -----------------------------------------------------------------------
+      # 前置校验：build-bootstraps.sh 里的每个字面量包名都要能解析到源码目录
+      #   （该脚本曾写 bzip2 / curl / xz-utils，真实目录是 libbz2 / libcurl / liblzma）
+      # -----------------------------------------------------------------------
+      - name: Preflight - package names resolve
+        run: |
+          set -uo pipefail
+          mapfile -t dirs < <(jq -r 'del(.pkg_format) | keys | .[]' repo.json)
+          echo "repos: ${dirs[*]}"
+
+          # 只取字面量包名：丢掉 $var / ${var} / "$var" 这类运行时才展开的项
+          # （build-bootstraps.sh 里 PACKAGES+=("$add_pkg") 等三处是循环变量，
+          #   并非真实包名，早期版本误报为 unresolved）
+          mapfile -t pkgs < <(grep -oP 'PACKAGES\+=\("\K[^"]+' scripts/build-bootstraps.sh \
+                              | grep -v '\$' | sort -u)
+          echo "bootstrap packages (${#pkgs[@]}): ${pkgs[*]}"
+          echo
+
+          missing=0
+          for p in "${pkgs[@]}"; do
+            hit=""
+            for d in "${dirs[@]}"; do
+              [ -d "$d/$p" ] && { hit="$d"; break; }
+            done
+            if [ -z "$hit" ]; then
+              echo "::error title=unresolved::$p 没有对应源码目录"
+              missing=$((missing+1))
+            else
+              printf 'ok  %-16s -> %s\n' "$p" "$hit/$p"
+            fi
           done
+          echo "unresolved=$missing / total=${#pkgs[@]}"
+          [ "$missing" -eq 0 ]
+
+      # -----------------------------------------------------------------------
+      # 前置断言：CI checkout 出来的 build-bootstraps.sh 必须已含 4 处修复。
+      # 否则会在几个小时后挂在 bzip2 找不到 / rm -f /*，白跑一轮。
+      # 这 4 处若只在本地改了没 commit，CI 看不到 —— 这里就是拦住这种情况。
+      # -----------------------------------------------------------------------
+      - name: Preflight - build-bootstraps.sh fixes present
+        run: |
+          set -uo pipefail
+          f=scripts/build-bootstraps.sh
+          bad=0
+          grep -qF 'PACKAGES+=("libbz2")' "$f" \
+            && echo "ok  libbz2 rename" \
+            || { echo "::error::缺 libbz2 修复（仍是 bzip2）→ 请 commit build-bootstraps.sh"; bad=1; }
+          ! grep -qF 'TERMUX_BUILT_PACKAGES_DIRECTORY_FOR_ARCH' "$f" \
+            && echo "ok  rm-for-arch guarded" \
+            || { echo "::error::缺 rm -f /* 修复（未定义变量仍被引用）"; bad=1; }
+          grep -qF 'rm -rf -- "${TERMUX_BUILT_DEBS_DIRECTORY:?}/"*' "$f" \
+            && echo "ok  debs rm guarded" \
+            || { echo "::error::缺 TERMUX_BUILT_DEBS_DIRECTORY 的 :? 保护"; bad=1; }
+          grep -qF 'add_termux_bootstrap_second_stage_files "$TERMUX_ARCH"' "$f" \
+            && echo "ok  arch var fixed" \
+            || { echo "::error::缺 package_arch→TERMUX_ARCH 修复"; bad=1; }
+          if [ "$bad" -ne 0 ]; then
+            echo "::error::build-bootstraps.sh 的修复未进入本次 commit，请 git add + commit + push 后重跑"
+            exit 1
+          fi
+          echo "BUILD_BOOTSTRAP_FIXES_PRESENT"
+
+      - name: Rewrite package name
+        env:
+          PKG: ${{ matrix.flavor.package_name }}
+        run: |
+          set -euo pipefail
+          cp scripts/properties.sh scripts/properties.sh.bak
+
+          sed -i "s|^TERMUX_APP__PACKAGE_NAME=.*|TERMUX_APP__PACKAGE_NAME=\"$PKG\"|" scripts/properties.sh
+
+          echo '--- 改动确认（应只剩新包名）---'
+          grep -nE '^TERMUX_APP__PACKAGE_NAME=' scripts/properties.sh
+
+          echo
+          echo '--- 派生链验证 ---'
+          TERMUX_SCRIPTDIR="$PWD" bash -c '
+            . ./scripts/properties.sh
+            printf "PACKAGE  = %s\nDATA_DIR = %s\nROOTFS   = %s\nPREFIX   = %s\nHOME     = %s\n" \
+              "$TERMUX_APP__PACKAGE_NAME" \
+              "$TERMUX_APP__DATA_DIR" \
+              "$TERMUX__ROOTFS" \
+              "$TERMUX__PREFIX" \
+              "$TERMUX__HOME"
+          '
+
+          echo
+          echo '--- 断言 ---'
+          TERMUX_SCRIPTDIR="$PWD" bash -c '
+            . ./scripts/properties.sh
+            want="/data/data/'"$PKG"'/files/usr"
+            if [ "$TERMUX__PREFIX" != "$want" ]; then
+              echo "::error::PREFIX 不符预期：实际=$TERMUX__PREFIX 期望=$want"
+              exit 1
+            fi
+            case "$TERMUX__PREFIX" in
+              *com.termux*) echo "::error::PREFIX 仍含 com.termux"; exit 1 ;;
+            esac
+            echo "PREFIX_OK = $TERMUX__PREFIX"
+          '
+
+      # -----------------------------------------------------------------------
+      # 容器权限对齐（本次 CI 失败的真实原因）
+      #
+      # build-bootstraps.sh 的最后一跳：
+      #   L246  zip -r9 "${BOOTSTRAP_TMPDIR}/bootstrap-<arch>.zip" ./*
+      #   L249  mv -f "${BOOTSTRAP_TMPDIR}/bootstrap-<arch>.zip" "$TERMUX_PACKAGES_DIRECTORY/"
+      # 而 L32 是硬编码：TERMUX_PACKAGES_DIRECTORY="/home/builder/termux-packages"
+      # —— 即 run-docker.sh 挂进容器的**宿主仓库根目录**。
+      #
+      # run-docker.sh 只在宿主 uid 既不是 1001 也不是 0 时才去容器里 chown：
+      #   if [ $(id -u) -ne 1001 -a $(id -u) -ne 0 ]; then docker exec ... chown -R $(id -u) ...
+      # GitHub runner 的 uid 恰好是 1001，这段被整段跳过。一旦镜像内 builder 的
+      # uid 与宿主不一致，宿主仓库根对容器用户就不可写，于是：
+      #   mv: cannot create regular file '/home/builder/termux-packages/bootstrap-aarch64.zip': Permission denied
+      #
+      # 注意 publish_archive 里 mv 失败后 L251 照样 echo "[*] Finished successfully"，
+      # 属于**假绿**；真正的兜底是下面 Collect 步骤的 ls 检查（这次就是它拦下来的）。
+      #
+      # 处理：先按官方 CI 的做法把容器拉起来（packages.yml 里的 Load Docker image），
+      # 读出容器默认用户 uid/gid，再把宿主仓库根目录放开写权限。
+      # 只对仓库根这一层 chmod、不递归：mv 的目标就是这一层，代价恒定。
+      # -----------------------------------------------------------------------
+      - name: Load builder container
+        run: ./scripts/run-docker.sh true
+
+      # -----------------------------------------------------------------------
+      # 给 publish_archive 打补丁：产物落点改到容器家目录
+      #
+      # 根因（本次 CI 完整日志已证实）：
+      #   container user = 1001:1001 | host user = 1001:1001   （uid 相同）
+      #   rw=false                                             （挂载本身可写）
+      #   workspace after : drwxrwxrwx                         （chmod 777 已生效）
+      #   touch: Permission denied                             （容器内进程仍写不进 bind 目录）
+      # GitHub Actions 的 docker 对 bind 挂载存在额外的隔离，chown/chmod 都救不了。
+      #
+      # build-bootstraps.sh L246 的 zip 落在容器内 BOOTSTRAP_TMPDIR(/tmp)，成功；
+      # L249 的 mv 目标是 bind 仓库根，失败。所以只要让产物同时留一份到
+      # /home/builder（builder 拥有、不是挂载点、可写、且不在 trap 的清理路径里），
+      # 再由 workflow 用宿主侧 docker cp 取出即可。docker cp 经 docker daemon，
+      # 不受容器→宿主的写权限限制。
+      # -----------------------------------------------------------------------
+      - name: Patch publish_archive output location
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import io, sys
+          p = "scripts/build-bootstraps.sh"
+          s = io.open(p, encoding="utf-8").read()
+
+          old = '\tmv -f "${BOOTSTRAP_TMPDIR}/bootstrap-${1}.zip" "$TERMUX_PACKAGES_DIRECTORY/"'
+          new = (
+              '\tcp -f "${BOOTSTRAP_TMPDIR}/bootstrap-${1}.zip" "/home/builder/bootstrap-${1}.zip"\n'
+              '\tmv -f "${BOOTSTRAP_TMPDIR}/bootstrap-${1}.zip" "$TERMUX_PACKAGES_DIRECTORY/" \\\n'
+              '\t\t|| echo "[WARN] repo root unwritable from container; kept copy at /home/builder/bootstrap-${1}.zip"'
+          )
+
+          if old not in s:
+              sys.exit("PUBLISH_MV_LINE_NOT_FOUND")
+          if s.count(old) != 1:
+              sys.exit("PUBLISH_MV_LINE_NOT_UNIQUE: %d" % s.count(old))
+
+          io.open(p, "w", encoding="utf-8", newline="").write(s.replace(old, new))
+          print("PATCHED publish_archive")
+          PY
+          grep -n 'home/builder/bootstrap' scripts/build-bootstraps.sh
+
+      # -----------------------------------------------------------------------
+      # 编译 + 打包（build-bootstraps.sh 依赖 builder 容器内的工具链）
+      # -----------------------------------------------------------------------
+      - name: Build bootstrap archive
+        env:
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+          ADD_PACKAGES:  ${{ inputs.add_packages }}
+        run: |
+          set -euo pipefail
+          args=(--architectures "${{ matrix.arch }}")
+          if [ "$FORCE_REBUILD" = "true" ]; then args+=(-f); fi
+          if [ -n "${ADD_PACKAGES:-}" ]; then args+=(--add "$ADD_PACKAGES"); fi
+
+          echo "==> ./scripts/build-bootstraps.sh ${args[*]}"
+          ./scripts/run-docker.sh ./scripts/build-bootstraps.sh "${args[@]}"
+
+      - name: Collect artifacts
+        run: |
+          set -uo pipefail
+          cid=termux-package-builder
+          arch="${{ matrix.arch }}"
+          flavor="${{ matrix.flavor.id }}"
+          mkdir -p out
+
+          # 主路径：产物在容器家目录 /home/builder（builder 拥有、非 bind 挂载、可写）。
+          # 用 docker cp 经 daemon 取出，绕开容器写不进 bind 目录的限制。
+          if docker cp "$cid:/home/builder/bootstrap-$arch.zip" "out/bootstrap-$arch-$flavor.zip" 2>/dev/null; then
+            echo "COLLECTED via docker cp from container:/home/builder"
+          # 回退：容器→仓库根的 mv 若成功（本地/非隔离 runner），产物就在仓库根
+          elif [ -f "bootstrap-$arch.zip" ]; then
+            cp -v "bootstrap-$arch.zip" "out/bootstrap-$arch-$flavor.zip"
+            echo "COLLECTED via repo root"
+          else
+            echo "::error::仓库根与容器家目录都没有 bootstrap-$arch.zip"
+            echo "--- container /home/builder ---"; docker exec "$cid" ls -l /home/builder/ || true
+            echo "--- repo root ---"; ls -l bootstrap-*.zip || true
+            exit 1
+          fi
+
+          ls -l out
+          test -s "out/bootstrap-$arch-$flavor.zip" || { echo "::error::产物为空"; exit 1; }
+
+      # -----------------------------------------------------------------------
+      # 验收：证明前缀是真的编译进去了，不是只改了目录名
+      # -----------------------------------------------------------------------
+      - name: Verify compiled-in prefix
+        env:
+          PKG: ${{ matrix.flavor.package_name }}
+        run: |
+          set -uo pipefail
+          zipfile="$(ls -1 "$PWD"/out/*.zip | head -n1)"
+          echo "archive = $zipfile ($(stat -c%s "$zipfile") bytes)"
+
+          rm -rf chk && mkdir -p chk
+          python3 -c "import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall('chk')" "$zipfile"
+
+          echo
+          echo '===== 1) SYMLINKS.txt 前 5 行（链接目标应是新前缀）====='
+          head -5 chk/SYMLINKS.txt 2>/dev/null || echo '(无 SYMLINKS.txt)'
+
+          echo
+          echo '===== 2) 残留 com.termux 的文件 ====='
+          OLD=$(grep -rlaF 'com.termux' chk 2>/dev/null | wc -l)
+          echo "OLD_PREFIX_FILES = $OLD"
+          grep -rlaF 'com.termux' chk 2>/dev/null | head -10
+
+          echo
+          echo '===== 3) 含新包名的文件 ====='
+          NEW=$(grep -rlaF "$PKG" chk 2>/dev/null | wc -l)
+          echo "NEW_PREFIX_FILES = $NEW"
+
+          echo
+          echo '===== 4) 抽查 ELF 里烧死的路径 ====='
+          for b in chk/bin/bash chk/bin/apt chk/bin/dpkg; do
+            [ -f "$b" ] || continue
+            echo "--- $b"
+            strings -a "$b" 2>/dev/null | grep -E '^/data/data/' | sort -u | head -5
+          done
+
+          echo
+          echo '===== 5) 归档根结构（应与官方一致：只有 usr 合并格式）====='
+          ls chk | head -20
+
+          echo
+          echo '===== 结论 ====='
+          echo "期望 PREFIX = /data/data/$PKG/files/usr"
+          if [ "$NEW" -gt 0 ] && [ "$OLD" -lt 50 ]; then
+            echo "PREFIX_SWITCH_LOOKS_OK  new=$NEW old=$OLD"
+          else
+            echo "::warning::前缀替换可能不完整 new=$NEW old=$OLD"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-${{ matrix.flavor.id }}-${{ matrix.arch }}
+          path: out/*.zip
+          if-no-files-found: error
+          retention-days: 30
