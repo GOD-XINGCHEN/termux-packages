@@ -146,25 +146,56 @@ jobs:
       # 否则会在几个小时后挂在 bzip2 找不到 / rm -f /*，白跑一轮。
       # 这 4 处若只在本地改了没 commit，CI 看不到 —— 这里就是拦住这种情况。
       # -----------------------------------------------------------------------
+      # -----------------------------------------------------------------------
+      # 前置断言：build-bootstraps.sh 必须已含 4 处修复。
+      #
+      # 这一版按**脚本里的真实写法**校验，不是按我们以为的写法：
+      #   · 清理用的是 `rm -f` 而不是 `rm -rf`（之前断言写成 rm -rf，永远不匹配）
+      #   · TERMUX_BUILT_PACKAGES_DIRECTORY 是合法存在的变量（第 34 行定义），
+      #     真正要防的是 `${VAR:?}` 保护缺失，而不是这个变量名出现
+      #
+      # 断言仍逐条 print ok/缺什么，失败时能直接看出是第几条没进 commit。
+      # -----------------------------------------------------------------------
       - name: Preflight - build-bootstraps.sh fixes present
         run: |
           set -uo pipefail
           f=scripts/build-bootstraps.sh
           bad=0
-          grep -qF 'PACKAGES+=("libbz2")' "$f" \
-            && echo "ok  libbz2 rename" \
-            || { echo "::error::缺 libbz2 修复（仍是 bzip2）→ 请 commit build-bootstraps.sh"; bad=1; }
-          ! grep -qF 'TERMUX_BUILT_PACKAGES_DIRECTORY_FOR_ARCH' "$f" \
-            && echo "ok  rm-for-arch guarded" \
-            || { echo "::error::缺 rm -f /* 修复（未定义变量仍被引用）"; bad=1; }
-          grep -qF 'rm -rf -- "${TERMUX_BUILT_DEBS_DIRECTORY:?}/"*' "$f" \
-            && echo "ok  debs rm guarded" \
-            || { echo "::error::缺 TERMUX_BUILT_DEBS_DIRECTORY 的 :? 保护"; bad=1; }
-          grep -qF 'add_termux_bootstrap_second_stage_files "$TERMUX_ARCH"' "$f" \
-            && echo "ok  arch var fixed" \
-            || { echo "::error::缺 package_arch→TERMUX_ARCH 修复"; bad=1; }
+
+          # 1) bzip2 -> libbz2（上游已把包目录改名，旧名会让 build-package 找不到配方）
+          if grep -qF 'PACKAGES+=("libbz2")' "$f" && ! grep -qF 'PACKAGES+=("bzip2")' "$f"; then
+            echo "ok   libbz2 rename"
+          else
+            echo "::error::缺 libbz2 修复（仍是 bzip2）→ 请 commit build-bootstraps.sh"; bad=1
+          fi
+
+          # 2) 清理 built-packages 目录前必须有 :? 保护
+          #    原写法 rm -f "$TERMUX_BUILT_PACKAGES_DIRECTORY_FOR_ARCH"/*
+          #    变量为空时会变成 rm -f /*，必须拦。
+          if grep -qF 'rm -f -- "${TERMUX_BUILT_PACKAGES_DIRECTORY_FOR_ARCH:?}/"*' "$f"; then
+            echo "ok   built-packages rm guarded"
+          else
+            echo "::error::缺 TERMUX_BUILT_PACKAGES_DIRECTORY_FOR_ARCH 的 :? 保护"; bad=1
+          fi
+
+          # 3) 清理 debs 目录前必须有 :? 保护（注意是 rm -f，不是 rm -rf）
+          if grep -qF 'rm -f -- "${TERMUX_BUILT_DEBS_DIRECTORY:?}/"*' "$f"; then
+            echo "ok   debs rm guarded"
+          else
+            echo "::error::缺 TERMUX_BUILT_DEBS_DIRECTORY 的 :? 保护"; bad=1
+          fi
+
+          # 4) 第二阶段文件按 TERMUX_ARCH 取，不是未定义的 $package_arch
+          if grep -qF 'add_termux_bootstrap_second_stage_files "$TERMUX_ARCH"' "$f"; then
+            echo "ok   arch var fixed"
+          else
+            echo "::error::缺 package_arch→TERMUX_ARCH 修复"; bad=1
+          fi
+
           if [ "$bad" -ne 0 ]; then
             echo "::error::build-bootstraps.sh 的修复未进入本次 commit，请 git add + commit + push 后重跑"
+            echo '--- 当前脚本里相关行 ---'
+            grep -nE 'PACKAGES\+=\("(lib)?bz2"|BUILT_(PACKAGES|DEBS)_DIRECTORY|rm -f --|second_stage_files' "$f" || true
             exit 1
           fi
           echo "BUILD_BOOTSTRAP_FIXES_PRESENT"
