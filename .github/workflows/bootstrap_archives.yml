@@ -513,7 +513,8 @@ jobs:
           # run-docker.sh 里透传到宿主，这里再利用 tee 分包。
           ./scripts/run-docker.sh ./scripts/build-bootstraps.sh "${args[@]}" 2>&1 \
             | tee /tmp/build-bootstrap.log \
-            | docker exec -i termux-package-builder tee /home/builder/build-bootstrap.log >/dev/null || true
+            | { docker exec -i termux-package-builder tee /home/builder/build-bootstrap.log >/dev/null 2>&1 \
+                || cat >/dev/null; }
 
       - name: Collect artifacts
         if: always()
