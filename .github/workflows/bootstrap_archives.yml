@@ -162,9 +162,12 @@ jobs:
       # 这里提前用 repo.json 里的目录清单挡掉。
       # -----------------------------------------------------------------------
       - name: Preflight - add_packages exist
-        if: ${{ inputs.add_packages != '' }}
+        # 校验逻辑：优先用手填的，没有就校验默认清单。
+        # 之前这里 `if: inputs.add_packages != ''`，导致默认清单完全跳过校验 ——
+        # 112 个包名如果有拼错，会在编译几十分钟后才暴露。
+        if: ${{ inputs.add_packages != '' || env.DEFAULT_ADD_PACKAGES != '' }}
         env:
-          ADD_PACKAGES: ${{ inputs.add_packages }}
+          ADD_PACKAGES: ${{ inputs.add_packages != '' && inputs.add_packages || env.DEFAULT_ADD_PACKAGES }}
         run: |
           set -uo pipefail
           mapfile -t repos < <(jq -r 'del(.pkg_format) | keys | .[]' repo.json)
@@ -558,9 +561,31 @@ jobs:
           DL_RETRIES: ${{ inputs.download_retries }}
           DL_DELAY: ${{ inputs.download_retry_delay }}
           DL_MAX: ${{ inputs.download_retry_max }}
+          # dispatch 手填的增包清单；留空则回落 DEFAULT_ADD_PACKAGES
+          ADD_PACKAGES_INPUT: ${{ inputs.add_packages }}
         run: |
           set +e
           args=(--architectures "${{ matrix.arch }}")
+
+          # ------------------------------------------------------------------
+          # 把增包清单接进来。
+          #   inputs.add_packages 非空 -> 用它（手动覆盖）
+          #   否则 -> 用 DEFAULT_ADD_PACKAGES（对齐 v3 的完整工具链）
+          #
+          # 之前这里只有 --architectures，DEFAULT_ADD_PACKAGES 定义了却从没拼上，
+          # 等于白写。build-bootstraps.sh 的 --add 只认主包名，逗号分隔。
+          # ------------------------------------------------------------------
+          ADD_LIST="${ADD_PACKAGES_INPUT:-}"
+          if [ -z "$ADD_LIST" ]; then
+            ADD_LIST="${DEFAULT_ADD_PACKAGES:-}"
+          fi
+          if [ -n "$ADD_LIST" ]; then
+            n=$(printf '%s' "$ADD_LIST" | tr ',' '\n' | grep -c . || true)
+            echo "==> --add $n packages"
+            args+=(--add "$ADD_LIST")
+          else
+            echo "==> --add 未指定，使用默认包集"
+          fi
 
           # ------------------------------------------------------------------
           # run-docker.sh 只转发 CI / DOCKER_EXEC_PID_FILE_PATH 两个变量进容器，
