@@ -45,11 +45,15 @@ on:
         default: true
 
 permissions:
+  # write 是为了把构建产物发到 Release（比 artifact 好下载、且不会 30 天过期）。
+  # 只给 job 级别需要的那一个，不整体提权。
   contents: read
 
 concurrency:
+  # 一次 bootstrap 要跑几小时，误触发一次就把前一轮杀掉 = 白烧几小时机器时间。
+  # 所以不取消在跑的，改为排队（gh workflow run 连续点也会依次执行）。
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
 
@@ -94,6 +98,10 @@ jobs:
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 355
+    permissions:
+      # 发 Release 需要 write。两个 matrix 并行跑，各自创建/更新同名 Release
+      # 可能撞车，所以用「同一个 tag + 覆盖上传」策略（见 Publish step）。
+      contents: write
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
@@ -645,3 +653,66 @@ jobs:
           path: out/*
           if-no-files-found: warn
           retention-days: 30
+
+      # -----------------------------------------------------------------------
+      # 发布到 Release —— 「构建成功之后要能把文件传出来」的落地。
+      #
+      # 为什么需要它（artifact 不够用）：
+      #   1. artifact 要登录才能下载，且 30 天过期；
+      #   2. artifact 是 zip 包，手机上还得解一层；
+      #   3. 想让手机端 App 直接拉取，需要一个稳定可预测的 URL。
+      #
+      # Release 附件则：公开可下、永久有效、URL 可直接拼出来。
+      #
+      # tag 策略：`bootstrap-<flavor>-latest` 固定不变，每次**覆盖**同名附件。
+      # 不用时间戳 tag 是因为那会让下载 URL 每次都变，App 侧没法写死。
+      # 需要历史版本时去 artifact 或者查 Actions 记录。
+      # -----------------------------------------------------------------------
+      - name: Publish to Release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FLAVOR: ${{ matrix.flavor.id }}
+          ARCH: ${{ matrix.arch }}
+          PKGNAME: ${{ matrix.flavor.package_name }}
+        run: |
+          set +e
+
+          # 只有真的产出 zip 才发布：Collect 阶段已保证 out/ 里有日志，
+          # 这里必须只挑 bootstrap-*.zip，别把日志也发上去。
+          ZIP=$(ls out/bootstrap-*.zip 2>/dev/null | head -1)
+          if [ -z "$ZIP" ]; then
+            echo "::warning::没有产物 zip，跳过 Release 发布"
+            exit 0
+          fi
+          echo "upload: $ZIP ($(stat -c%s "$ZIP") bytes)"
+
+          TAG="bootstrap-${FLAVOR}-latest"
+          TITLE="Bootstrap (${FLAVOR}, ${ARCH}) - latest"
+          ASSET="bootstrap-${ARCH}-${FLAVOR}.zip"
+
+          # 统一改名成可预测的名字，方便 App 拼接下载地址
+          cp -f "$ZIP" "/tmp/$ASSET"
+
+          # Release 不存在就创建；已存在则复用（并行 matrix 会撞，属正常）
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+                 --title "$TITLE" \
+                 --notes "自动构建：$(date -u '+%Y-%m-%d %H:%M UTC')  |  arch=${ARCH}  |  package=${PKGNAME}  |  编译期前缀 /data/data/${PKGNAME}/files/usr"
+
+          # 覆盖同名附件：--clobber 让重复发布不会失败
+          gh release upload "$TAG" "/tmp/$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
+
+          # 把下载地址写进摘要，省得再去网页里翻
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${ASSET}"
+          echo "DOWNLOAD_URL=$URL"
+          {
+            echo "### 下载地址（${FLAVOR} / ${ARCH}）"
+            echo ""
+            echo "\`\`\`"
+            echo "$URL"
+            echo "\`\`\`"
+            echo ""
+            echo "大小：$(stat -c%s "/tmp/$ASSET") 字节"
+          } >> "$GITHUB_STEP_SUMMARY"
+
