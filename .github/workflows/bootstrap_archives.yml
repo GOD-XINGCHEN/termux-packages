@@ -690,12 +690,44 @@ jobs:
           LOG=/tmp/build-bootstrap.log
           : > "$LOG"
 
-          echo "==> ./scripts/build-bootstraps.sh ${args[*]}"
-          # 关键：不用管道 + pipefail（管道 + set -e 会让 tee 之外的部分行为难料），
-          # 改成重定向到文件再 tee 回显。退出码由 $? 显式捕获。
-          ./scripts/run-docker.sh ./scripts/build-bootstraps.sh "${args[@]}" > "$LOG" 2>&1
-          rc=$?
-          cat "$LOG"
+          echo "==> ./scripts/run-docker.sh ./scripts/build-bootstraps.sh ${args[*]}"
+          echo "==> 开始时间 $(date -u +%FT%TZ)"
+
+          # ------------------------------------------------------------------
+          # 日志必须**实时**可见。
+          #
+          # 早期版本写成 `cmd > "$LOG" 2>&1` 再在末尾 `cat "$LOG"`：
+          # 目的是保证失败时一定有完整日志，但代价是整个编译期间
+          # Actions 步骤日志是空的 —— 构建卡住时完全看不出卡在哪个包，
+          # 也不知道到底在编什么。默认（不增包）的构建反而能实时看到
+          # 几十万行输出，这个反差正说明问题出在这里。
+          #
+          # 改成 tee：边跑边输出，同时落盘留底。
+          # 管道会丢掉被测命令的退出码，所以退出码必须从 PIPESTATUS[0] 取，
+          # 不能用 $?（那是 tee 的退出码，永远是 0）。
+          # ------------------------------------------------------------------
+          #
+          # 另外加一个心跳：每 5 分钟在日志里打一行当前时间和日志行数。
+          # 作用是在长时间无输出（比如某个包 configure 卡住）时，
+          # 仍能判断进程是活的还是死的，而不是盯着空白页干等。
+          (
+            while sleep 300; do
+              printf '\n[heartbeat %s] log lines=%s size=%s\n' \
+                "$(date -u +%FT%TZ)" \
+                "$(wc -l < "$LOG" 2>/dev/null || echo 0)" \
+                "$(wc -c < "$LOG" 2>/dev/null || echo 0)"
+            done
+          ) &
+          hb_pid=$!
+
+          ./scripts/run-docker.sh ./scripts/build-bootstraps.sh "${args[@]}" 2>&1 | tee -a "$LOG"
+          rc=${PIPESTATUS[0]}
+
+          kill "$hb_pid" 2>/dev/null || true
+          wait "$hb_pid" 2>/dev/null || true
+
+          echo
+          echo "==> 结束时间 $(date -u +%FT%TZ)，退出码 $rc，日志 $(wc -l < "$LOG") 行"
 
           echo "BUILD_EXIT_CODE=$rc"
           echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
