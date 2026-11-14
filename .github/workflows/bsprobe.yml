@@ -1,0 +1,14 @@
+name: BsProbe
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - '.github/bsprobe.txt'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo PROBE_OK
