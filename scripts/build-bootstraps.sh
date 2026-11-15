@@ -791,6 +791,96 @@ main() {
 		}
 
 		resolve_bootstrap_order || true
+		# Break the libmpg123/pulseaudio/libsndfile/libmp3lame cycle by pre-building
+		# its members in dependency-safe order.
+		#
+		# The cycle:
+		#   libmpg123 --BUILD_DEPENDS--> pulseaudio --DEPENDS--> libsndfile
+		#       ^                                                    |
+		#       +-------------- DEPENDS -------- libmp3lame <---------+
+		#
+		# Building libmpg123 normally makes termux_step_get_dependencies resolve its
+		# build-deps, which recurses into pulseaudio -> libsndfile -> libmp3lame. That
+		# recursive build of libmp3lame runs with -s (TERMUX_SKIP_DEPCHECK), so its own
+		# dependencies are not installed for it, and its configure aborts with
+		#   checking for libmpg123 >= 1.26.0... no
+		#   configure: error: no, libmpg123 not found
+		# because libmpg123 has not been installed yet at that point.
+		#
+		# No ordering of a flat build list can satisfy a cycle, so the members are
+		# staged instead:
+		#   1. libmpg123 with dep checking skipped. mpg123's configure treats a missing
+		#      libpulse as "pulse output module not built" rather than an error
+		#      (check_forced is only set when --with-audio is passed, which the recipe
+		#      does not do). The library and its headers land in the sysroot.
+		#   2. libmp3lame normally: its DEPENDS (libiconv, libmpg123) now exist, so
+		#      configure finds libmpg123.pc.
+		#   3. pulseaudio normally: libsndfile -> libmp3lame -> libmpg123 are all
+		#      present, so the rest of the chain resolves without recursion.
+		# The main loop then rebuilds libmpg123 with pulseaudio in the sysroot, so the
+		# pulse output module is compiled in. Nothing is disabled.
+		bootstrap_prestage_audio_cycle() {
+
+			local arch="$1"
+			local rc
+			local -a saved_options=("${BUILD_PACKAGE_OPTIONS[@]}")
+
+			# Only needed when all four members are actually part of this build.
+			local pkg
+			for pkg in libmpg123 libmp3lame pulseaudio libsndfile; do
+				if [[ " ${PACKAGES[*]} " != *" $pkg "* ]]; then
+					echo "[*] audio cycle pre-stage skipped: $pkg not in this build"
+					return 0
+				fi
+			done
+
+			echo "[*] Audio cycle pre-stage: libmpg123 (no depcheck) -> libmp3lame -> pulseaudio"
+
+			# 1. libmpg123 without dependency resolution.
+			#    -s sets TERMUX_SKIP_DEPCHECK, which makes termux_step_get_dependencies
+			#    return immediately, so pulseaudio is not pulled in recursively.
+			BUILD_PACKAGE_OPTIONS+=("-s")
+			build_package "$arch" "libmpg123"
+			rc=$?
+			BUILD_PACKAGE_OPTIONS=("${saved_options[@]}")
+			if [ "$rc" -ne 0 ]; then
+				echo "[!] audio cycle pre-stage: libmpg123 failed ($rc)" 1>&2
+				return "$rc"
+			fi
+
+			# 2. libmp3lame now that libmpg123.pc exists.
+			build_package "$arch" "libmp3lame"
+			rc=$?
+			if [ "$rc" -ne 0 ]; then
+				echo "[!] audio cycle pre-stage: libmp3lame failed ($rc)" 1>&2
+				return "$rc"
+			fi
+
+			# 3. pulseaudio now that the whole libsndfile chain below it is built.
+			build_package "$arch" "pulseaudio"
+			rc=$?
+			if [ "$rc" -ne 0 ]; then
+				echo "[!] audio cycle pre-stage: pulseaudio failed ($rc)" 1>&2
+				return "$rc"
+			fi
+
+			# Drop libmpg123's "already built" marker so the main loop rebuilds
+			# it. Step 1 built it with no libpulse in the sysroot, so its pulse
+			# output module was skipped. Now that pulseaudio is installed the
+			# rebuild compiles that module in; without this the archive would ship
+			# without pulse support even though nothing was explicitly disabled.
+			if [ -d "$TERMUX_BUILT_PACKAGES_DIRECTORY" ]; then
+				rm -f -- "$TERMUX_BUILT_PACKAGES_DIRECTORY/libmpg123"
+				echo "[*] cleared libmpg123 build marker so the main loop rebuilds it with pulse"
+			fi
+
+			echo "[*] Audio cycle pre-stage done; main loop will rebuild libmpg123 with pulse support"
+			return 0
+		}
+
+		bootstrap_prestage_audio_cycle "$TERMUX_ARCH" || return $?
+
+
 		# Build packages.
 		for package_name in "${PACKAGES[@]}"; do
 			set +e
