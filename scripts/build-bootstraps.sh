@@ -678,6 +678,119 @@ main() {
 		done
 		unset add_pkg
 
+		# Order packages by runtime dependencies before building them.
+		#
+		# Packages used to be built in the order written above, with each package's
+		# dependencies resolved separately inside
+		# scripts/build/termux_step_get_dependencies.sh. That only works while the
+		# prebuilt-deb path ("-i") is available. In a renamed fork build-package.sh
+		# disables it ("Ignoring -i option to download dependencies ..."), every
+		# dependency then builds from source, and the per-package resolver orders by
+		# mixing TERMUX_PKG_BUILD_DEPENDS into the graph. On the audio chain that mix
+		# is cyclic:
+		#
+		#   pulseaudio --DEPENDS------->  libsndfile
+		#   libsndfile --DEPENDS------->  libmp3lame
+		#   libmp3lame --DEPENDS------->  libmpg123
+		#   libmpg123  --BUILD_DEPENDS->  pulseaudio
+		#
+		# so pulseaudio gets built before libsndfile exists, its meson configure
+		# cannot find sndfile.pc, and the build dies at
+		# '../src/meson.build:613:14: ERROR: Dependency "sndfile" not found'.
+		#
+		# scripts/resolve-bootstrap-order.py breaks that by ordering on runtime edges
+		# only. Build-deps are still satisfied at compile time by the per-package
+		# resolver, exactly as before; they just no longer constrain install order.
+		# If the helper is missing or fails, the flat list is kept, so this can never
+		# make the build worse than it was.
+		resolve_bootstrap_order() {
+
+			local script="${TERMUX_SCRIPTDIR}/scripts/resolve-bootstrap-order.py"
+			local -a packages_dirs=()
+			local seen_dirs=" "
+			local -a dir_args=()
+			local -a ordered=()
+			local -a dropped=()
+			local dir
+			local line
+			local pkg
+			local found
+
+			if [ ! -f "$script" ]; then
+				echo "[!] resolve-bootstrap-order.py missing; keeping flat build order" 1>&2
+				return 1
+			fi
+
+			for dir in \
+				"${TERMUX_PACKAGES_DIRECTORY}/packages" \
+				"${TERMUX_PACKAGES_DIRECTORY}/x11-packages" \
+				"${TERMUX_PACKAGES_DIRECTORY}/root-packages" \
+				"${TERMUX_SCRIPTDIR}/packages" \
+				"${TERMUX_SCRIPTDIR}/x11-packages" \
+				"${TERMUX_SCRIPTDIR}/root-packages"; do
+				[ -d "$dir" ] || continue
+				# TERMUX_SCRIPTDIR and TERMUX_PACKAGES_DIRECTORY normally resolve
+				# to the same checkout, so dedupe: buildorder.py aborts with
+				# "Duplicated package" if one directory is passed twice.
+				dir="$(realpath -m "$dir")"
+				case "$seen_dirs" in
+					*" $dir "*) continue ;;
+				esac
+				seen_dirs="$seen_dirs$dir "
+				packages_dirs+=("$dir")
+			done
+
+			if [ "${#packages_dirs[@]}" -eq 0 ]; then
+				echo "[!] no package directories found; keeping flat build order" 1>&2
+				return 1
+			fi
+
+			for dir in "${packages_dirs[@]}"; do
+				dir_args+=("--packages-dir" "$dir")
+			done
+
+			# Run from the source tree: the helper imports the sibling buildorder.py,
+			# which resolves recipe paths relative to it. stderr is tagged so ordering
+			# diagnostics can be told apart from build output.
+			if ! mapfile -t ordered < <(
+				cd "${TERMUX_SCRIPTDIR}" &&
+				TERMUX_ARCH="$TERMUX_ARCH" python3 "$script" \
+					--names-only "${PACKAGES[@]}" "${dir_args[@]}" 2> >(sed "s/^/[order] /" >&2)
+			); then
+				echo "[!] dependency ordering failed; keeping flat build order" 1>&2
+				return 1
+			fi
+
+			# mapfile also succeeds on an empty stream, so check the size explicitly.
+			if [ "${#ordered[@]}" -eq 0 ]; then
+				echo "[!] dependency ordering produced nothing; keeping flat build order" 1>&2
+				return 1
+			fi
+
+			# Never silently drop a requested package: anything the ordering helper did
+			# not return gets appended, so the archive still contains it.
+			for pkg in "${PACKAGES[@]}"; do
+				found=0
+				for line in "${ordered[@]}"; do
+					if [ "$line" = "$pkg" ]; then
+						found=1
+						break
+					fi
+				done
+				[ "$found" -eq 0 ] && dropped+=("$pkg")
+			done
+
+			echo "[*] Build order resolved: ${#PACKAGES[@]} requested -> ${#ordered[@]} packages (runtime deps first)"
+			if [ "${#dropped[@]}" -gt 0 ]; then
+				echo "[!] ordering omitted ${#dropped[@]} package(s), appending: ${dropped[*]}" 1>&2
+				ordered+=("${dropped[@]}")
+			fi
+
+			PACKAGES=("${ordered[@]}")
+			return 0
+		}
+
+		resolve_bootstrap_order || true
 		# Build packages.
 		for package_name in "${PACKAGES[@]}"; do
 			set +e
