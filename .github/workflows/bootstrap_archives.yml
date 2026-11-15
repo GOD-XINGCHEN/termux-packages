@@ -698,9 +698,8 @@ jobs:
           # 之前用 `| tee -a "$LOG"` 实时输出，结果是几十万行逐行推到 Actions
           # 日志里，页面直接卡死、翻都翻不动。所以改回重定向。
           #
-          # 代价是过程中看不到日志 —— 用下面的心跳补：每 3 分钟打一行
-          # 时间+行数+大小，足够判断「在跑 / 卡住 / 大概到哪了」，
-          # 而且只占几十字节，不会卡页面。
+          # 代价是构建期间页面上不会出现任何输出，进度只能等结束时看，
+          # 或者结束后去 artifact 里翻完整日志。
           #
           # 完整日志在构建结束时一次性打印尾部 200 行（见下），
           # 全文仍然完整落盘并随 artifact 上传，需要时去下载。
@@ -708,18 +707,9 @@ jobs:
           SNAP=/tmp/build-bootstrap.snapshot.log
           : > "$SNAP"
 
-          # 心跳：只打印统计，不搬内容
-          ( while sleep 180; do
-              printf '[heartbeat %s] lines=%s size=%s\n' \
-                "$(date -u +%FT%TZ)" \
-                "$(wc -l < "$LOG" 2>/dev/null || echo 0)" \
-                "$(wc -c < "$LOG" 2>/dev/null || echo 0)"
-            done ) &
-          hb_pid=$!
-
           # 后台持续备份：容器里那份日志也定期捞到宿主，
           # 这样即便容器最终被删，宿主上仍有一份较新的副本。
-          # 与上面的心跳分开跑，避免搬运耗时影响心跳节奏。
+          # 独立后台循环，与构建主流程互不阻塞。
           ( while sleep 300; do
               docker cp "termux-package-builder:/home/builder/build-bootstrap.log" \
                 "$SNAP" 2>/dev/null || true
@@ -728,8 +718,8 @@ jobs:
 
           # 无论怎么退出都收掉后台进程，避免留下僵尸循环
           final_sync() {
-            kill "$hb_pid" "$snap_pid" 2>/dev/null || true
-            wait "$hb_pid" "$snap_pid" 2>/dev/null || true
+            kill "$snap_pid" 2>/dev/null || true
+            wait "$snap_pid" 2>/dev/null || true
             docker cp "termux-package-builder:/home/builder/build-bootstrap.log" \
               "$SNAP" 2>/dev/null || true
           }
@@ -939,9 +929,6 @@ jobs:
               else
                 echo "snapshot empty -- guard loop never captured anything"
               fi
-              echo
-              echo "-- heartbeat log (host side) --"
-              grep -a '\[heartbeat' /tmp/build-bootstrap.log 2>/dev/null | tail -20 || echo '(none)'
             } > "out/$LOGNAME"
             echo "::warning::日志四路救援全部失败，已写入诊断说明"
           fi
