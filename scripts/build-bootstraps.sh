@@ -991,12 +991,47 @@ main() {
 			fi
 		}
 
+		# Drop packages a previous run already produced.
+		#
+		# Without this the loop walks all ${#PACKAGES[@]} entries and each already-built
+		# one still pays for build-package.sh startup and dependency resolution before
+		# printing "built - skipping". On a resumed run that is most of the wall clock
+		# spent on no work at all.
+		#
+		# Runs after the audio pre-stage on purpose: the pre-stage clears libmpg123's
+		# marker so the loop rebuilds it with pulse support, and filtering earlier would
+		# drop it from the queue and ship an mpg123 with no pulse backend.
 		# Record the plan before executing it, so progress is measurable.
 		# The done-markers alone answer "what finished" but not "what is left";
 		# with the plan on disk the remaining work is a set difference.
+		# The plan records the full ordered set, not just this run's queue, so the
+		# done-vs-total ratio reflects real progress across resumed runs.
 		mkdir -p "$(dirname "$TERMUX_BUILD_PLAN_FILE")" 2>/dev/null || true
-		printf '%s\n' "${PACKAGES[@]}" > "$TERMUX_BUILD_PLAN_FILE" 2>/dev/null || true
-		echo "[*] Build plan recorded: $TERMUX_BUILD_PLAN_FILE ($(wc -l < "$TERMUX_BUILD_PLAN_FILE" 2>/dev/null || echo 0) packages)"
+		if [ ! -s "$TERMUX_BUILD_PLAN_FILE" ]; then
+			printf '%s\n' "${PACKAGES[@]}" > "$TERMUX_BUILD_PLAN_FILE" 2>/dev/null || true
+		fi
+		echo "[*] Build plan: $TERMUX_BUILD_PLAN_FILE ($(wc -l < "$TERMUX_BUILD_PLAN_FILE" 2>/dev/null || echo 0) packages, $(wc -l < "$TERMUX_BUILD_PLAN_FILE" 2>/dev/null || echo 0) total)"
+
+		filter_already_built() {
+			local pkg
+			local -a remaining=()
+			local skipped=0
+			[ -d "$TERMUX_BUILT_PACKAGES_DIRECTORY" ] || return 0
+			for pkg in "${PACKAGES[@]}"; do
+				if [ -f "$TERMUX_BUILT_PACKAGES_DIRECTORY/$pkg" ]; then
+					skipped=$((skipped + 1))
+				else
+					remaining+=("$pkg")
+				fi
+			done
+			echo "[*] queue: ${#PACKAGES[@]} planned, $skipped already built, ${#remaining[@]} to build"
+			if [ "${#remaining[@]}" -eq 0 ]; then
+				echo "[*] nothing left to build; every planned package is already present"
+			fi
+			PACKAGES=("${remaining[@]}")
+		}
+
+		filter_already_built
 
 		# Build packages.
 		for package_name in "${PACKAGES[@]}"; do
