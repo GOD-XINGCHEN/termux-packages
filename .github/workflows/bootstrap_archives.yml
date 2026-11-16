@@ -623,6 +623,25 @@ jobs:
           restore-keys: |
             bootstrap-${{ matrix.arch }}-${{ matrix.flavor.id }}-${{ matrix.flavor.package_name }}-
 
+      - name: Push cache into container
+        if: inputs.resume_build
+        run: |
+          set +e
+          cid=termux-package-builder
+          # The marker mirror lives at /tmp/.ci-cache inside the container: the
+          # mounted repo root is not writable by the container user (run-docker
+          # only chowns it when the host uid is neither 1001 nor 0, and GitHub
+          # runners are 1001). Stage it back in so build-bootstraps.sh finds it.
+          if [ -d .ci-cache ]; then
+            docker exec -u 0 "$cid" rm -rf /tmp/.ci-cache 2>/dev/null || true
+            docker exec -u 0 "$cid" mkdir -p /tmp/.ci-cache 2>/dev/null || true
+            docker cp .ci-cache/. "$cid":/tmp/.ci-cache/ 2>/dev/null || true
+            docker exec -u 0 "$cid" sh -c 'chown -R 1001:1001 /tmp/.ci-cache 2>/dev/null || true'
+            echo "staged markers: $(docker exec "$cid" sh -c 'ls -1 /tmp/.ci-cache/built-packages 2>/dev/null | wc -l')"
+          else
+            echo "no .ci-cache on host; nothing to stage"
+          fi
+
       - name: Cache status
         if: inputs.resume_build
         run: |
@@ -862,6 +881,26 @@ jobs:
       # 只缓存这两个目录：都落在 run-docker.sh 挂进来的宿主仓库根目录下，
       # 容器里 /data 下那份不挂载、随容器消失，所以脚本特意做了镜像。
       # -----------------------------------------------------------------------
+      - name: Pull cache out of container (${{ matrix.flavor.id }})
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+          cid=termux-package-builder
+          mkdir -p .ci-cache
+          # Markers live inside the container; copy them out so actions/cache can
+          # pick them up. docker cp runs as the host user, so container ownership
+          # does not matter here.
+          if docker inspect "$cid" >/dev/null 2>&1; then
+            docker cp "$cid":/tmp/.ci-cache/. .ci-cache/ 2>/dev/null || true
+          fi
+          echo "--- plan ---"
+          wc -l < .ci-cache/build-plan.txt 2>/dev/null || echo 0
+          echo "--- built markers ---"
+          ls -1 .ci-cache/built-packages 2>/dev/null | wc -l || echo 0
+          echo "--- debs in mounted repo root ---"
+          ls -1 output/*.deb 2>/dev/null | wc -l || echo 0
+
       - name: Save build cache (${{ matrix.flavor.id }})
         if: always() && steps.build.outcome != 'skipped'
         continue-on-error: true
@@ -871,6 +910,34 @@ jobs:
             output
             .ci-cache
           key: bootstrap-${{ matrix.arch }}-${{ matrix.flavor.id }}-${{ matrix.flavor.package_name }}-v1-${{ github.run_id }}
+
+      - name: Build progress summary
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+          PLAN=.ci-cache/build-plan.txt
+          DONE=.ci-cache/built-packages
+          echo "===== build progress ====="
+          if [ -f "$PLAN" ]; then
+            total=$(wc -l < "$PLAN")
+            echo "planned : $total"
+            if [ -d "$DONE" ]; then
+              # Set difference: names in the plan that have no marker.
+              find "$DONE" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort > /tmp/_done.txt
+              sort "$PLAN" > /tmp/_plan.txt
+              comm -23 /tmp/_plan.txt /tmp/_done.txt > /tmp/_left.txt
+              echo "built   : $(( total - $(wc -l < /tmp/_left.txt) ))"
+              echo "remaining: $(wc -l < /tmp/_left.txt)"
+              echo "--- next packages not yet built (first 40) ---"
+              head -40 /tmp/_left.txt
+            else
+              echo "built   : 0 (no markers found)"
+            fi
+          else
+            echo "no build plan recorded; the build did not reach the package loop"
+            ls -1 output/*.deb 2>/dev/null | wc -l | xargs echo "debs produced:"
+          fi
 
       - name: Cache saved summary
         if: always()

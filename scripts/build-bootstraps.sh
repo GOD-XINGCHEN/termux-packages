@@ -45,7 +45,18 @@ FORCE_BUILD_PACKAGES=0
 #
 # This directory sits inside TERMUX_PACKAGES_DIRECTORY, which run-docker.sh does
 # mount from the host, so its contents survive and can be cached across runs.
-TERMUX_BUILT_PACKAGES_MIRROR="$TERMUX_PACKAGES_DIRECTORY/.ci-cache/built-packages"
+# Where the durable copy of the markers lives.
+#
+# Must be somewhere the container user can create directories. The mounted repo
+# root is not: run-docker.sh only chowns it when the host uid is neither 1001 nor
+# 0, and GitHub runners are 1001, so the container's builder user cannot mkdir
+# there ("Permission denied"). /tmp inside the container is writable, and the
+# workflow lifts the result out with docker cp, which runs as the host user.
+TERMUX_BUILT_PACKAGES_MIRROR="${TERMUX_CI_CACHE_DIR:-/tmp/.ci-cache}/built-packages"
+
+# Written before the build loop: the full ordered plan, one package per line.
+# Diffing it against the built-package directory answers "what is left".
+TERMUX_BUILD_PLAN_FILE="${TERMUX_CI_CACHE_DIR:-/tmp/.ci-cache}/build-plan.txt"
 
 # Set TERMUX_KEEP_BUILT_PACKAGES=1 to resume from a previous run instead of
 # wiping everything. Still forced off whenever the package name changed, because
@@ -628,6 +639,38 @@ main() {
 			fi
 		fi
 
+		# Reconstitute markers from debs when the marker store lost them.
+		#
+		# A deb is named <pkg>_<fullversion>_<arch>.deb, which is exactly what
+		# the marker file contains, so the debs alone are enough to resume. This
+		# matters because the two caches can drift: the deb output lives in the
+		# mounted repo root and always survives, while markers historically did
+		# not. Rebuilding them here means a run that only preserved output/ still
+		# does not recompile everything.
+		adopt_debs_as_markers() {
+			local deb name version
+			local adopted=0
+			[ -d "$TERMUX_BUILT_DEBS_DIRECTORY" ] || return 0
+			mkdir -p "$TERMUX_BUILT_PACKAGES_DIRECTORY" 2>/dev/null || return 0
+			for deb in "$TERMUX_BUILT_DEBS_DIRECTORY"/*.deb; do
+				[ -e "$deb" ] || continue
+				name="$(basename "$deb")"
+				# <pkg>_<version>_<arch>.deb -- split from the right so versions
+				# containing underscores stay intact.
+				name="${name%.deb}"
+				version="${name##*_}"
+				name="${name%_*}"
+				version="${name##*_}"
+				name="${name%_*}"
+				[ -n "$name" ] && [ -n "$version" ] || continue
+				[ -e "$TERMUX_BUILT_PACKAGES_DIRECTORY/$name" ] && continue
+				printf '%s\n' "$version" > "$TERMUX_BUILT_PACKAGES_DIRECTORY/$name" 2>/dev/null || continue
+				adopted=$((adopted + 1))
+			done
+			[ "$adopted" -gt 0 ] && echo "[*] adopted $adopted package(s) from existing debs"
+			return 0
+		}
+
 		# Resuming: restore the markers the previous run managed to record, so
 		# build-package.sh prints "built - skipping" instead of rebuilding.
 		if [[ "$TERMUX_KEEP_BUILT_PACKAGES" == "1" ]]; then
@@ -636,8 +679,10 @@ main() {
 				cp -a "$TERMUX_BUILT_PACKAGES_MIRROR"/. "$TERMUX_BUILT_PACKAGES_DIRECTORY"/ 2>/dev/null || true
 				echo "[*] resumed markers: $(find "$TERMUX_BUILT_PACKAGES_DIRECTORY" -maxdepth 1 -type f | wc -l) packages marked built"
 			else
-				echo "[*] resume requested but $TERMUX_BUILT_PACKAGES_MIRROR is absent: full build"
+				echo "[*] resume requested but $TERMUX_BUILT_PACKAGES_MIRROR is absent"
 			fi
+			# Whatever the marker store did not cover is recovered from the debs.
+			adopt_debs_as_markers
 		fi
 
 		BOOTSTRAP_ROOTFS="$BOOTSTRAP_TMPDIR/rootfs-${TERMUX_ARCH}"
@@ -932,7 +977,26 @@ main() {
 			[ -d "$TERMUX_BUILT_PACKAGES_DIRECTORY" ] || return 0
 			mkdir -p "$TERMUX_BUILT_PACKAGES_MIRROR" || return 0
 			cp -a "$TERMUX_BUILT_PACKAGES_DIRECTORY"/. "$TERMUX_BUILT_PACKAGES_MIRROR"/ 2>/dev/null || true
+			
+			# Progress line: how many of the planned packages exist, and the tail
+			# of what is still missing. Cheap enough to run per package and it makes
+			# the log answer "how far along is this" without reading the plan by hand.
+			if [ -f "$TERMUX_BUILD_PLAN_FILE" ]; then
+				local total done_n remaining
+				total=$(wc -l < "$TERMUX_BUILD_PLAN_FILE" 2>/dev/null || echo 0)
+				done_n=$(find "$TERMUX_BUILT_PACKAGES_DIRECTORY" -maxdepth 1 -type f 2>/dev/null | wc -l)
+				remaining=$((total - done_n))
+				[ "$remaining" -lt 0 ] && remaining=0
+				printf '[*] progress: %s/%s built, %s remaining\n' "$done_n" "$total" "$remaining"
+			fi
 		}
+
+		# Record the plan before executing it, so progress is measurable.
+		# The done-markers alone answer "what finished" but not "what is left";
+		# with the plan on disk the remaining work is a set difference.
+		mkdir -p "$(dirname "$TERMUX_BUILD_PLAN_FILE")" 2>/dev/null || true
+		printf '%s\n' "${PACKAGES[@]}" > "$TERMUX_BUILD_PLAN_FILE" 2>/dev/null || true
+		echo "[*] Build plan recorded: $TERMUX_BUILD_PLAN_FILE ($(wc -l < "$TERMUX_BUILD_PLAN_FILE" 2>/dev/null || echo 0) packages)"
 
 		# Build packages.
 		for package_name in "${PACKAGES[@]}"; do
