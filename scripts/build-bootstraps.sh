@@ -58,6 +58,16 @@ TERMUX_BUILT_PACKAGES_MIRROR="${TERMUX_CI_CACHE_DIR:-/tmp/.ci-cache}/built-packa
 # Diffing it against the built-package directory answers "what is left".
 TERMUX_BUILD_PLAN_FILE="${TERMUX_CI_CACHE_DIR:-/tmp/.ci-cache}/build-plan.txt"
 
+# Records which app package name the cached debs were built for.
+#
+# The name is compiled into every artefact (ELF DT_RUNPATH, script $PREFIX
+# defaults), so a cache built under one name must never be adopted under
+# another. Comparing this stamp against the current build's own resolved prefix
+# catches a mismatch that the cache key alone would miss if the key were built
+# from a stale or hand-edited value.
+TERMUX_CACHE_STAMP_FILE="${TERMUX_CI_CACHE_DIR:-/tmp/.ci-cache}/package-name.txt"
+
+
 # Set TERMUX_KEEP_BUILT_PACKAGES=1 to resume from a previous run instead of
 # wiping everything. Still forced off whenever the package name changed, because
 # cached debs bake the old prefix into their ELF DT_RUNPATH and reusing them
@@ -650,6 +660,29 @@ main() {
 		adopt_debs_as_markers() {
 			local deb name version
 			local adopted=0
+			local current_pkg="${TERMUX_APP__PACKAGE_NAME:-unknown}"
+			local cached_pkg=""
+			
+			# Refuse to adopt anything unless the cache was built for the same
+			# app package name. A deb from another name is not merely stale: its
+			# ELF DT_RUNPATH points at a different data dir, so shipping it yields
+			# a bootstrap that cannot find its own libraries.
+			if [ -f "$TERMUX_CACHE_STAMP_FILE" ]; then
+				cached_pkg="$(cat "$TERMUX_CACHE_STAMP_FILE" 2>/dev/null | tr -d '[:space:]')"
+			fi
+			if [ -n "$cached_pkg" ] && [ "$cached_pkg" != "$current_pkg" ]; then
+				echo "[!] cache was built for package name '$cached_pkg' but this build is '$current_pkg'" 1>&2
+				echo "[!] refusing to reuse cached debs; they carry the wrong prefix in their ELF DT_RUNPATH" 1>&2
+				echo "[!] run with resume_build=false to rebuild from scratch" 1>&2
+				return 0
+			fi
+			if [ -z "$cached_pkg" ] && [ -d "$TERMUX_BUILT_DEBS_DIRECTORY" ]; then
+				if compgen -G "$TERMUX_BUILT_DEBS_DIRECTORY/*.deb" > /dev/null 2>&1; then
+					echo "[!] debs present but no package-name stamp; refusing to adopt them" 1>&2
+					echo "[!] run with resume_build=false to rebuild from scratch" 1>&2
+					return 0
+				fi
+			fi
 			[ -d "$TERMUX_BUILT_DEBS_DIRECTORY" ] || return 0
 			mkdir -p "$TERMUX_BUILT_PACKAGES_DIRECTORY" 2>/dev/null || return 0
 			for deb in "$TERMUX_BUILT_DEBS_DIRECTORY"/*.deb; do
@@ -978,6 +1011,13 @@ main() {
 			mkdir -p "$TERMUX_BUILT_PACKAGES_MIRROR" || return 0
 			cp -a "$TERMUX_BUILT_PACKAGES_DIRECTORY"/. "$TERMUX_BUILT_PACKAGES_MIRROR"/ 2>/dev/null || true
 			
+			# Stamp the package name next to the markers. Written on every call so a
+			# cache always describes the name its contents were built for, even if the
+			# workflow-level key were somehow wrong.
+			if [ -d "$(dirname "$TERMUX_CACHE_STAMP_FILE")" ]; then
+				printf '%s\n' "${TERMUX_APP__PACKAGE_NAME:-unknown}" > "$TERMUX_CACHE_STAMP_FILE" 2>/dev/null || true
+			fi
+			
 			# Progress line: how many of the planned packages exist, and the tail
 			# of what is still missing. Cheap enough to run per package and it makes
 			# the log answer "how far along is this" without reading the plan by hand.
@@ -1009,6 +1049,10 @@ main() {
 		mkdir -p "$(dirname "$TERMUX_BUILD_PLAN_FILE")" 2>/dev/null || true
 		if [ ! -s "$TERMUX_BUILD_PLAN_FILE" ]; then
 			printf '%s\n' "${PACKAGES[@]}" > "$TERMUX_BUILD_PLAN_FILE" 2>/dev/null || true
+		fi
+		echo "[*] Building for package name: ${TERMUX_APP__PACKAGE_NAME:-unknown} (prefix ${TERMUX__PREFIX:-?})"
+		if [ -f "$TERMUX_CACHE_STAMP_FILE" ]; then
+			echo "[*] Cache stamp says: $(cat "$TERMUX_CACHE_STAMP_FILE" 2>/dev/null | tr -d '[:space:]')"
 		fi
 		echo "[*] Build plan: $TERMUX_BUILD_PLAN_FILE ($(wc -l < "$TERMUX_BUILD_PLAN_FILE" 2>/dev/null || echo 0) packages, $(wc -l < "$TERMUX_BUILD_PLAN_FILE" 2>/dev/null || echo 0) total)"
 

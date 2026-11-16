@@ -623,6 +623,39 @@ jobs:
           restore-keys: |
             bootstrap-${{ matrix.arch }}-${{ matrix.flavor.id }}-${{ matrix.flavor.package_name }}-
 
+      - name: Verify cache package name
+        if: inputs.resume_build
+        run: |
+          set +e
+          want="${{ matrix.flavor.package_name }}"
+          stamp=""
+          [ -f .ci-cache/package-name.txt ] && stamp="$(tr -d '[:space:]' < .ci-cache/package-name.txt)"
+          debs=$(ls -1 output/*.deb 2>/dev/null | wc -l)
+
+          echo "expected package name : $want"
+          echo "cache stamp           : ${stamp:-<none>}"
+          echo "debs in cache         : $debs"
+
+          # The package name is compiled into every artefact (ELF DT_RUNPATH,
+          # script $PREFIX defaults). A deb from another name is not stale, it
+          # is unusable: shipping it yields a bootstrap that cannot find its own
+          # libraries. So a mismatch is fatal for the cache, not a warning.
+          if [ "$debs" -gt 0 ] && [ -n "$stamp" ] && [ "$stamp" != "$want" ]; then
+            echo "::warning::cache was built for '$stamp' but this build wants '$want'"
+            echo "::warning::discarding cached debs; they carry the wrong prefix"
+            rm -rf output .ci-cache
+            mkdir -p output .ci-cache
+            echo "cache discarded"
+          elif [ "$debs" -gt 0 ] && [ -z "$stamp" ]; then
+            echo "::warning::cached debs present but no package-name stamp"
+            echo "::warning::cannot prove they match '$want'; discarding to be safe"
+            rm -rf output .ci-cache
+            mkdir -p output .ci-cache
+            echo "cache discarded"
+          else
+            echo "cache accepted for '$want'"
+          fi
+
       - name: Push cache into container
         if: inputs.resume_build
         run: |
