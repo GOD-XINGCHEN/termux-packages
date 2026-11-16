@@ -59,6 +59,11 @@ on:
         description: "单次退避上限（秒）"
         required: false
         default: "300"
+      resume_build:
+        description: "复用上一次的构建产物（同包名）。首次构建或换包名时必须关掉"
+        required: false
+        type: boolean
+        default: false
       force_rebuild:
         description: "强制重编（-f）。**必须保持 true**：换过包名后，旧 deb 缓存里的 ELF 仍烧着 com.termux 前缀，复用会产出「有残留」的坏 bootstrap；增包时依赖 deb 前缀不一致还会让 configure 直接失败"
         required: false
@@ -595,6 +600,38 @@ jobs:
       # 任何一行非零退出都会**立即终止整个 step** —— 后面的搬日志代码根本执行不到。
       # 之前就是这个原因导致「failed 但没有任何日志」。
       # -----------------------------------------------------------------------
+      # -----------------------------------------------------------------------
+      # 按 flavor 分别缓存已构建的包。
+      #
+      # 两个 flavor 的包名不同（debug=me.sources.ai.debug，perf=me.sources.ai），
+      # 而包名会被烧进每个 ELF 的 DT_RUNPATH 和脚本的 $PREFIX 默认值，所以
+      # 一个 flavor 产出的 deb 对另一个完全不可用。key 里带上包名本身，
+      # 换名字的那一刻缓存就自动失效，不需要人记得去清。
+      #
+      # v1 是可手动递增的世代号：actions/cache 的 key 不可变，取消的 job
+      # 不会上传内容，遇到需要强制重建时改这个数字即可。
+      # -----------------------------------------------------------------------
+      - name: Restore build cache (${{ matrix.flavor.id }})
+        id: cache-restore
+        if: inputs.resume_build
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            output
+            .ci-cache
+          key: bootstrap-${{ matrix.arch }}-${{ matrix.flavor.id }}-${{ matrix.flavor.package_name }}-v1
+          restore-keys: |
+            bootstrap-${{ matrix.arch }}-${{ matrix.flavor.id }}-${{ matrix.flavor.package_name }}-
+
+      - name: Cache status
+        if: inputs.resume_build
+        run: |
+          echo "cache-hit=${{ steps.cache-restore.outputs.cache-hit }}"
+          echo "--- restored debs ---"
+          ls -1 output/*.deb 2>/dev/null | wc -l || true
+          echo "--- restored markers ---"
+          ls -1 .ci-cache/built-packages 2>/dev/null | wc -l || true
+
       - name: Build bootstrap archive
         id: build
         env:
@@ -684,8 +721,20 @@ jobs:
           # 自检：确认容器里真的能读到（失败也不中断，只是留证据）
           docker exec termux-package-builder env 2>/dev/null | grep -q TERMUX_DOWNLOAD || true
 
-          # 永远加 -f：换包名后旧 deb 缓存里的 ELF 仍烧着 com.termux 前缀
+          # -f 会清空 deb 缓存和已构建标记。
+          #
+          # 换包名后必须清：旧 deb 里的 ELF 仍烧着旧前缀，复用会产出坏 bootstrap。
+          # 但包名稳定后，每次全清等于把上一次跑了几小时的结果扔掉 —— 6 小时
+          # 上限下永远跑不完。所以：
+          #   首次构建 / 换包名 / 包清单变动 -> 清（默认）
+          #   已有成功缓存且要续跑         -> 不清，交给 TERMUX_KEEP_BUILT_PACKAGES
           args+=(-f)
+          if [[ "${{ inputs.resume_build }}" == "true" ]]; then
+            export TERMUX_DOCKER_EXEC_EXTRA_ARGS="${TERMUX_DOCKER_EXEC_EXTRA_ARGS:-} --env TERMUX_KEEP_BUILT_PACKAGES=1"
+            echo "==> resume_build=true：保留已构建包，本次只补未完成的"
+          else
+            echo "==> resume_build=false：清空缓存从头构建"
+          fi
 
           LOG=/tmp/build-bootstrap.log
           : > "$LOG"
@@ -800,6 +849,40 @@ jobs:
       # 全部失败时写诊断文件，保证 artifact 里能看出「为什么没拿到」，
       # 而不是静默空上传（那会让人误以为步骤根本没跑）。
       # -----------------------------------------------------------------------
+      # -----------------------------------------------------------------------
+      # 保存按 flavor 隔离的构建缓存。
+      #
+      # 用 always() 而不是依赖 actions/cache 的 job 结束钩子：job 被取消时
+      # 那个钩子不执行，而 6 小时上限下「取消」是常态而非异常。
+      #
+      # 缓存内容：
+      #   output/*.deb       已编译的包（换包名即失效，key 里带包名）
+      #   .ci-cache/         已构建标记，build-bootstraps.sh 每包回写一次
+      #
+      # 只缓存这两个目录：都落在 run-docker.sh 挂进来的宿主仓库根目录下，
+      # 容器里 /data 下那份不挂载、随容器消失，所以脚本特意做了镜像。
+      # -----------------------------------------------------------------------
+      - name: Save build cache (${{ matrix.flavor.id }})
+        if: always() && steps.build.outcome != 'skipped'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            output
+            .ci-cache
+          key: bootstrap-${{ matrix.arch }}-${{ matrix.flavor.id }}-${{ matrix.flavor.package_name }}-v1-${{ github.run_id }}
+
+      - name: Cache saved summary
+        if: always()
+        continue-on-error: true
+        run: |
+          echo "--- debs produced ---"
+          ls -1 output/*.deb 2>/dev/null | wc -l || echo 0
+          echo "--- markers persisted ---"
+          ls -1 .ci-cache/built-packages 2>/dev/null | wc -l || echo 0
+          echo "A later run with resume_build=true restores the newest key that matches"
+          echo "the flavor+package-name prefix and continues from there."
+
       - name: Collect artifacts
         if: always()
         run: |

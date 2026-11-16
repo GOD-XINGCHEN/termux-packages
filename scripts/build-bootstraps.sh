@@ -36,6 +36,23 @@ TERMUX_BUILT_PACKAGES_DIRECTORY="/data/data/.built-packages"
 IGNORE_BUILD_SCRIPT_NOT_FOUND_ERROR=1
 FORCE_BUILD_PACKAGES=0
 
+# Durable copy of TERMUX_BUILT_PACKAGES_DIRECTORY.
+#
+# TERMUX_BUILT_PACKAGES_DIRECTORY is /data/data/.built-packages, which lives in
+# the container's writable layer when /data is not bind-mounted (run-docker.sh
+# only does that with -m). Anything written there is lost the moment the
+# container goes away, so a cancelled build leaves no trace of what it finished.
+#
+# This directory sits inside TERMUX_PACKAGES_DIRECTORY, which run-docker.sh does
+# mount from the host, so its contents survive and can be cached across runs.
+TERMUX_BUILT_PACKAGES_MIRROR="$TERMUX_PACKAGES_DIRECTORY/.ci-cache/built-packages"
+
+# Set TERMUX_KEEP_BUILT_PACKAGES=1 to resume from a previous run instead of
+# wiping everything. Still forced off whenever the package name changed, because
+# cached debs bake the old prefix into their ELF DT_RUNPATH and reusing them
+# produces a bootstrap whose paths point at a package that no longer exists.
+TERMUX_KEEP_BUILT_PACKAGES="${TERMUX_KEEP_BUILT_PACKAGES:-0}"
+
 # A list of packages to build
 declare -a PACKAGES=()
 
@@ -603,8 +620,24 @@ main() {
 		termux_step_handle_buildarch
 
 		if [[ $FORCE_BUILD_PACKAGES == "1" ]]; then
-			rm -f -- "${TERMUX_BUILT_PACKAGES_DIRECTORY:?}/"*
-			rm -f -- "${TERMUX_BUILT_DEBS_DIRECTORY:?}/"*
+			if [[ "$TERMUX_KEEP_BUILT_PACKAGES" == "1" ]]; then
+				echo "[*] -f given but TERMUX_KEEP_BUILT_PACKAGES=1: keeping built packages and debs"
+			else
+				rm -f -- "${TERMUX_BUILT_PACKAGES_DIRECTORY:?}/"*
+				rm -f -- "${TERMUX_BUILT_DEBS_DIRECTORY:?}/"*
+			fi
+		fi
+
+		# Resuming: restore the markers the previous run managed to record, so
+		# build-package.sh prints "built - skipping" instead of rebuilding.
+		if [[ "$TERMUX_KEEP_BUILT_PACKAGES" == "1" ]]; then
+			if [ -d "$TERMUX_BUILT_PACKAGES_MIRROR" ]; then
+				mkdir -p "$TERMUX_BUILT_PACKAGES_DIRECTORY"
+				cp -a "$TERMUX_BUILT_PACKAGES_MIRROR"/. "$TERMUX_BUILT_PACKAGES_DIRECTORY"/ 2>/dev/null || true
+				echo "[*] resumed markers: $(find "$TERMUX_BUILT_PACKAGES_DIRECTORY" -maxdepth 1 -type f | wc -l) packages marked built"
+			else
+				echo "[*] resume requested but $TERMUX_BUILT_PACKAGES_MIRROR is absent: full build"
+			fi
 		fi
 
 		BOOTSTRAP_ROOTFS="$BOOTSTRAP_TMPDIR/rootfs-${TERMUX_ARCH}"
@@ -864,6 +897,14 @@ main() {
 				return "$rc"
 			fi
 
+			# Persist what the pre-stage built. Without this, a cancellation
+			# during the pre-stage would make the next run redo these three
+			# packages from scratch -- up to an hour of wasted work.
+			if [ -d "$TERMUX_BUILT_PACKAGES_DIRECTORY" ]; then
+				mkdir -p "$TERMUX_BUILT_PACKAGES_MIRROR"
+				cp -a "$TERMUX_BUILT_PACKAGES_DIRECTORY"/. "$TERMUX_BUILT_PACKAGES_MIRROR"/ 2>/dev/null || true
+			fi
+
 			# Drop libmpg123's "already built" marker so the main loop rebuilds
 			# it. Step 1 built it with no libpulse in the sysroot, so its pulse
 			# output module was skipped. Now that pulseaudio is installed the
@@ -881,10 +922,28 @@ main() {
 		bootstrap_prestage_audio_cycle "$TERMUX_ARCH" || return $?
 
 
+		# Mirror the built-package markers into the mounted repo root.
+		#
+		# Called after every package so a cancellation (GitHub kills the job at
+		# six hours) loses at most the package that was in flight. These are a
+		# few hundred bytes of text each, so the per-package cost is noise next
+		# to the compile time it protects.
+		mirror_built_packages() {
+			[ -d "$TERMUX_BUILT_PACKAGES_DIRECTORY" ] || return 0
+			mkdir -p "$TERMUX_BUILT_PACKAGES_MIRROR" || return 0
+			cp -a "$TERMUX_BUILT_PACKAGES_DIRECTORY"/. "$TERMUX_BUILT_PACKAGES_MIRROR"/ 2>/dev/null || true
+		}
+
 		# Build packages.
 		for package_name in "${PACKAGES[@]}"; do
 			set +e
-			build_package "$TERMUX_ARCH" "$package_name" || return $?
+			build_package "$TERMUX_ARCH" "$package_name"
+			build_rc=$?
+			mirror_built_packages
+			if [ "$build_rc" -ne 0 ]; then
+				set -e
+				return "$build_rc"
+			fi
 			set -e
 		done
 
