@@ -131,22 +131,32 @@ termux_step_post_configure() {
 	#     LLDBWrapPython.cpp:4083:19: error: use of undeclared identifier 'DBL_EPSILON'
 	#
 	# The file is a build product, so it cannot be patched as ordinary source.
-	# Generate it here, then insert the include; ninja sees the target already
-	# satisfied and does not overwrite it during the main build.
+	# Generate it here, then prepend the include.
+	#
+	# The include goes at the very TOP, not "before the first #include". An earlier
+	# version searched for an existing '#include <float.h>' and skipped when found
+	# -- but the generated source contains that string inside a conditional block
+	# that does not cover line 4083, so the guard passed while the macro stayed
+	# invisible. Placement at the top removes the scope question entirely, and the
+	# sentinel below marks the patch unambiguously instead of pattern-matching
+	# whatever SWIG happens to emit.
 	local swig_out="$TERMUX_PKG_BUILDDIR/tools/lldb/bindings/python/LLDBWrapPython.cpp"
+	local sentinel="/* patched-by-termux: float.h for DBL_EPSILON */"
 	if [[ "$TERMUX_PKG_CMAKE_BUILD" == "Ninja" ]]; then
 		ninja -j "$TERMUX_PKG_MAKE_PROCESSES" \
 			"tools/lldb/bindings/python/LLDBWrapPython.cpp" >/dev/null 2>&1 || true
 	fi
 	if [ -f "$swig_out" ]; then
-		if ! grep -q '#include <float.h>' "$swig_out"; then
-			# Put the include on its own line before the first existing #include.
-			# awk is used instead of a sed range-replace because the address form
-			# '0,/re/s||x|' is GNU-specific and easy to get wrong.
-			awk 'BEGIN{done=0} { if (!done && $0 ~ /^#include/) { print "#include <float.h>"; done=1 } print }' "$swig_out" > "$swig_out.tmp" && mv "$swig_out.tmp" "$swig_out"
-			echo "[*] patched DBL_EPSILON into $(basename "$swig_out")"
+		if grep -qF "$sentinel" "$swig_out"; then
+			echo "[*] LLDBWrapPython.cpp already patched for float.h"
 		else
-			echo "[*] $(basename "$swig_out") already includes <float.h>"
+			{
+				printf '#include <float.h>\n'
+				printf '%s\n' "$sentinel"
+				cat "$swig_out"
+			} > "$swig_out.patched"
+			mv "$swig_out.patched" "$swig_out"
+			echo "[*] prepended <float.h> to LLDBWrapPython.cpp"
 		fi
 	else
 		echo "[!] SWIG output not found at $swig_out; leaving it to the build step"
