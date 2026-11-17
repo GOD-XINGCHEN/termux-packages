@@ -694,27 +694,56 @@ main() {
 			fi
 
 			echo "[*] Installing cached debs into the sysroot..."
+			local workdir
+			workdir="$(mktemp -d "${TMPDIR:-/tmp}/debunpack.XXXXXX")" || workdir=""
+			if [ -z "$workdir" ]; then
+				echo "[!] cannot create a temp dir; skipping deb installation" 1>&2
+				return 0
+			fi
 			for deb in "$TERMUX_BUILT_DEBS_DIRECTORY"/*.deb; do
 				[ -e "$deb" ] || continue
-				data_archive=""
+				local data_archive="" tar_err
 				for cand in data.tar.xz data.tar.gz data.tar.bz2 data.tar; do
-					if ar p "$deb" "$cand" > /dev/null 2>&1; then
+					if ar p "$deb" "$cand" > "$workdir/data.tar" 2>/dev/null && [ -s "$workdir/data.tar" ]; then
 						data_archive="$cand"
 						break
 					fi
 				done
 				if [ -z "$data_archive" ]; then
 					failed=$((failed + 1))
-					echo "[!] no data member in $(basename "$deb")" 1>&2
+					echo "[!] no non-empty data member in $(basename "$deb")" 1>&2
 					continue
 				fi
-				if ar p "$deb" "$data_archive" 2>/dev/null | tar x --no-overwrite-dir -C / 2>/dev/null; then
+				# Extract from a file rather than stdin: ar keeps its end of the pipe open
+				# while tar streams, and a hiccup then surfaces as SIGPIPE with no text.
+				# The compression is known from the member name, so name it explicitly
+				# instead of asking tar to sniff it; some tars refuse to guess when the
+				# file on disk is called data.tar rather than data.tar.xz.
+				local decompress_flag=""
+				case "$data_archive" in
+					data.tar.xz)   decompress_flag="-J" ;;
+					data.tar.gz)   decompress_flag="-z" ;;
+					data.tar.bz2)  decompress_flag="-j" ;;
+					*)             decompress_flag="" ;;
+				esac
+				# Capture tar's status immediately. Testing $? after a case statement
+				# would read the case's own status, which is 0 whenever a branch matched --
+				# exactly the kind of silent success that hid the previous failure.
+				tar x${decompress_flag}f "$workdir/data.tar" -C / > /dev/null 2>"$workdir/err"
+				local tar_rc=$?
+				if [ "$tar_rc" -eq 0 ]; then
 					installed=$((installed + 1))
 				else
 					failed=$((failed + 1))
-					echo "[!] could not unpack $(basename "$deb")" 1>&2
+					# Show the first few failures with tar's own words; the rest would flood
+					# the log and hide the signal.
+					if [ "$failed" -le 3 ]; then
+						echo "[!] unpack failed: $(basename "$deb") [$data_archive]: $(head -2 "$workdir/err" 2>/dev/null | tr '\n' ' ')" 1>&2
+					fi
 				fi
+				rm -f "$workdir/data.tar"
 			done
+			rm -rf "$workdir"
 			echo "[*] installed $installed deb(s) into the sysroot, $failed failed"
 			return 0
 		}
