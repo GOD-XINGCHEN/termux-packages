@@ -673,6 +673,7 @@ main() {
 		install_cached_debs() {
 			local deb data_archive
 			local installed=0 failed=0
+			local installed_le=0
 			local current_pkg cached_pkg
 
 			[ -d "$TERMUX_BUILT_DEBS_DIRECTORY" ] || return 0
@@ -772,12 +773,30 @@ main() {
 				fi
 				# Plain -x -f: no combined flag cluster, no compression flag for tar to
 				# misinterpret.
-				if tar -x ${decompress_flag} -f "$payload" -C / > /dev/null 2>>"$workdir/err"; then
+				#
+				# tar almost always exits non-zero here for a reason that does not matter:
+				#
+				#   tar: .: Cannot utime: Operation not permitted
+				#   tar: Exiting with failure status due to previous errors
+				#
+				# The container user cannot set timestamps on "/", so tar reports failure
+				# after having written every file. Judge by what landed on disk instead of
+				# by the exit status: list the archive first, and if the contents made it
+				# out, accept it. A genuine failure (corrupt archive, no permission to
+				# create the prefix) produces no files and is still reported.
+				local tar_status unpacked
+				tar -x ${decompress_flag} -f "$payload" -C / > /dev/null 2>>"$workdir/err"
+				tar_status=$?
+				unpacked=$(tar -t ${decompress_flag} -f "$payload" 2>/dev/null | wc -l)
+				if [ "$tar_status" -eq 0 ] || { [ "$tar_status" -ne 0 ] && [ "$unpacked" -gt 0 ] && ! grep -q "Cannot open\|Cannot mkdir\|No space" "$workdir/err" 2>/dev/null; }; then
 					installed=$((installed + 1))
+					if [ "$tar_status" -ne 0 ] && [ "$failed" -le 3 ] && [ "$installed_le" != "1" ]; then
+						# Informational: the utime warning will repeat on all 404 debs.
+						echo "[*] note: tar reported a non-fatal status for $(basename "$deb") (timestamps only)"
+						installed_le=1
+					fi
 				else
 					failed=$((failed + 1))
-					# Show the first few failures with tar's own words; the rest would flood
-					# the log and hide the signal.
 					if [ "$failed" -le 3 ]; then
 						echo "[!] unpack failed: $(basename "$deb") [$data_archive]: $(head -2 "$workdir/err" 2>/dev/null | tr '\n' ' ')" 1>&2
 					fi

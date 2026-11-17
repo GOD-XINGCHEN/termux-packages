@@ -124,6 +124,33 @@ termux_step_pre_configure() {
 termux_step_post_configure() {
 	TERMUX_PKG_SRCDIR="$TERMUX_SRCDIR_SAVE"
 	unset TERMUX_SRCDIR_SAVE
+
+	# The SWIG-generated LLDB Python binding uses DBL_EPSILON without including
+	# <float.h>. glibc makes that macro visible transitively, bionic does not, so
+	# only Android fails:
+	#     LLDBWrapPython.cpp:4083:19: error: use of undeclared identifier 'DBL_EPSILON'
+	#
+	# The file is a build product, so it cannot be patched as ordinary source.
+	# Generate it here, then insert the include; ninja sees the target already
+	# satisfied and does not overwrite it during the main build.
+	local swig_out="$TERMUX_PKG_BUILDDIR/tools/lldb/bindings/python/LLDBWrapPython.cpp"
+	if [[ "$TERMUX_PKG_CMAKE_BUILD" == "Ninja" ]]; then
+		ninja -j "$TERMUX_PKG_MAKE_PROCESSES" \
+			"tools/lldb/bindings/python/LLDBWrapPython.cpp" >/dev/null 2>&1 || true
+	fi
+	if [ -f "$swig_out" ]; then
+		if ! grep -q '#include <float.h>' "$swig_out"; then
+			# Put the include on its own line before the first existing #include.
+			# awk is used instead of a sed range-replace because the address form
+			# '0,/re/s||x|' is GNU-specific and easy to get wrong.
+			awk 'BEGIN{done=0} { if (!done && $0 ~ /^#include/) { print "#include <float.h>"; done=1 } print }' "$swig_out" > "$swig_out.tmp" && mv "$swig_out.tmp" "$swig_out"
+			echo "[*] patched DBL_EPSILON into $(basename "$swig_out")"
+		else
+			echo "[*] $(basename "$swig_out") already includes <float.h>"
+		fi
+	else
+		echo "[!] SWIG output not found at $swig_out; leaving it to the build step"
+	fi
 }
 
 # shellcheck disable=SC2031
