@@ -1110,7 +1110,7 @@ main() {
 		if [[ "$TERMUX_KEEP_BUILT_PACKAGES" == "1" ]]; then
 			# Best-effort sysroot population. A failure here degrades the build
 			# (some packages may recompile) but must never abort it: the counters
-			inside the function already report what went wrong, and set +e keeps a
+			# inside the function already report what went wrong, and set +e keeps a
 			# stray non-zero from tripping the caller's set -e.
 			set +e
 			install_cached_debs
