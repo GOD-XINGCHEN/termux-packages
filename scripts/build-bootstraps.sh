@@ -702,7 +702,7 @@ main() {
 			fi
 			for deb in "$TERMUX_BUILT_DEBS_DIRECTORY"/*.deb; do
 				[ -e "$deb" ] || continue
-				local data_archive="" tar_err
+				local data_archive=""
 				for cand in data.tar.xz data.tar.gz data.tar.bz2 data.tar; do
 					if ar p "$deb" "$cand" > "$workdir/data.tar" 2>/dev/null && [ -s "$workdir/data.tar" ]; then
 						data_archive="$cand"
@@ -719,9 +719,10 @@ main() {
 				# The compression is known from the member name, so name it explicitly
 				# instead of asking tar to sniff it; some tars refuse to guess when the
 				# file on disk is called data.tar rather than data.tar.xz.
+				# -J is intentionally absent: xz is handled above, outside tar. gz and
+				# bz2 are handled by tar everywhere, so they keep their flags.
 				local decompress_flag=""
 				case "$data_archive" in
-					data.tar.xz)   decompress_flag="-J" ;;
 					data.tar.gz)   decompress_flag="-z" ;;
 					data.tar.bz2)  decompress_flag="-j" ;;
 					*)             decompress_flag="" ;;
@@ -731,7 +732,47 @@ main() {
 				# build before the next line can read $?. tar exits 2 on fatal errors, which
 				# is exactly the BUILD_EXIT_CODE=2 seen in the log, with the failure branch
 				# unreachable and no error text. Inside an if condition set -e stands down.
-				if tar x${decompress_flag}f "$workdir/data.tar" -C / > /dev/null 2>"$workdir/err"; then
+				# xz is decompressed outside tar. The container tar rejected -J with
+				# "This does not look like a tar archive" / "-J: Not found in archive",
+				# which is busybox tar behaving as if the flag were a member name. Rather
+				# than depend on tar having xz compiled in, unwrap the stream first and hand
+				# tar a plain archive. Every real Termux deb uses xz, so this is the path
+				# that matters.
+				local payload="$workdir/data.tar"
+				if [ "$data_archive" = "data.tar.xz" ]; then
+					local decompressed="$workdir/data.unpacked"
+					if command -v xz > /dev/null 2>&1; then
+						xz -dc "$workdir/data.tar" > "$decompressed" 2>"$workdir/err"
+					elif command -v unxz > /dev/null 2>&1; then
+						unxz -c "$workdir/data.tar" > "$decompressed" 2>"$workdir/err"
+					elif command -v busybox > /dev/null 2>&1 && busybox unxz --help > /dev/null 2>&1; then
+						busybox unxz -c "$workdir/data.tar" > "$decompressed" 2>"$workdir/err"
+					elif command -v python3 > /dev/null 2>&1; then
+						python3 -c "import lzma,sys,shutil;\
+						src=open(sys.argv[1],'rb'); \
+						dst=open(sys.argv[2],'wb'); \
+						shutil.copyfileobj(lzma.LZMAFile(src), dst)" "$workdir/data.tar" "$decompressed" 2>"$workdir/err"
+					else
+						echo "[!] no xz decompressor available" > "$workdir/err"
+					fi
+					# Decompression failure must be caught here: every decompressor writes to
+					# $decompressed and its status is discarded, so a failed xz leaves an empty
+					# file and tar then reports "This does not look like a tar archive", blaming
+					# the wrong tool. An empty result aborts this deb instead.
+					if [ -s "$decompressed" ]; then
+						payload="$decompressed"
+					else
+						failed=$((failed + 1))
+						if [ "$failed" -le 3 ]; then
+							echo "[!] xz produced nothing: $(basename "$deb"): $(head -2 "$workdir/err" 2>/dev/null | tr '\n' ' ')" 1>&2
+						fi
+						rm -f "$workdir/data.tar" "$decompressed"
+						continue
+					fi
+				fi
+				# Plain -x -f: no combined flag cluster, no compression flag for tar to
+				# misinterpret.
+				if tar -x ${decompress_flag} -f "$payload" -C / > /dev/null 2>>"$workdir/err"; then
 					installed=$((installed + 1))
 				else
 					failed=$((failed + 1))
@@ -1144,10 +1185,17 @@ main() {
 			if [ -f "$TERMUX_BUILD_PLAN_FILE" ]; then
 				local total done_n remaining
 				total=$(wc -l < "$TERMUX_BUILD_PLAN_FILE" 2>/dev/null || echo 0)
-				done_n=$(find "$TERMUX_BUILT_PACKAGES_DIRECTORY" -maxdepth 1 -type f 2>/dev/null | wc -l)
+				# Count only planned packages that have a marker. The marker
+				# directory also holds subpackage entries (aapt2, d8, dx ...), so its
+				# file count can exceed the plan and any total-based ratio is nonsense.
+				done_n=0
+				while IFS= read -r _pkg; do
+					[ -n "$_pkg" ] || continue
+					[ -e "$TERMUX_BUILT_PACKAGES_DIRECTORY/$_pkg" ] && done_n=$((done_n + 1))
+				done < "$TERMUX_BUILD_PLAN_FILE"
 				remaining=$((total - done_n))
 				[ "$remaining" -lt 0 ] && remaining=0
-				printf '[*] progress: %s/%s built, %s remaining\n' "$done_n" "$total" "$remaining"
+				printf '[*] progress: %s/%s planned built, %s remaining\n' "$done_n" "$total" "$remaining"
 			fi
 		}
 
