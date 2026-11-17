@@ -1,0 +1,9 @@
+#!/data/data/me.sources.ai.debug/files/usr/bin/bash
+# apksigner 包装：Sources-AI DEXKit 内置的 apksigner.jar
+# 用法与官方 apksigner 一致：apksigner sign|verify|... [args]
+set -euo pipefail
+PREFIX="${PREFIX:-/data/data/me.sources.ai.debug/files/usr}"
+JAR="$PREFIX/opt/Sources-AI-dexkit/tools/apksigner.jar"
+[ -f "$JAR" ] || { echo "缺少 $JAR" >&2; exit 1; }
+command -v java >/dev/null 2>&1 || { echo "缺少 java（pkg install openjdk-21）" >&2; exit 1; }
+exec java -jar "$JAR" "$@"

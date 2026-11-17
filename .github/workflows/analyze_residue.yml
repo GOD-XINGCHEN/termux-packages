@@ -1,0 +1,125 @@
+name: Analyze bootstrap residue
+
+# 直接在 Runner 上分析 Release 里的 bootstrap 包，找出所有 com.termux 残留。
+#
+# 为什么不在本地/PC 上做：375MB 的 zip 有 5 万多条目，逐字节扫一遍
+# 在受限环境里要几十分钟且容易压垮机器。Runner 算力和网络都更好，
+# 而且可以直接对着线上产物跑，避免"本地副本和线上不一致"的问题。
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "bootstrap zip 的 URL"
+        required: false
+        default: "https://github.com/GOD-XINGCHEN/termux-packages/releases/download/bootstrap-perf-latest/bootstrap-aarch64-perf.zip"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Download bootstrap
+        run: |
+          set -euo pipefail
+          url="${{ inputs.url }}"
+          echo "downloading $url"
+          curl -fL --retry 3 --retry-delay 5 -o bs.zip "$url"
+          ls -l bs.zip
+          sha256sum bs.zip
+
+      - name: Scan for com.termux
+        run: |
+          set -uo pipefail
+          python3 - <<'PY'
+          import zipfile, os
+
+          ZIP = 'bs.zip'
+          needle = b'com.termux'
+
+          elf_hits, txt_hits, other_hits = [], [], []
+          total = 0
+
+          with zipfile.ZipFile(ZIP) as z:
+              infos = [i for i in z.infolist() if i.file_size > 0]
+              print('entries with data: %d' % len(infos))
+
+              for info in infos:
+                  try:
+                      with z.open(info) as f:
+                          data = f.read()
+                  except Exception:
+                      continue
+
+                  n = data.count(needle)
+                  if n == 0:
+                      continue
+
+                  total += n
+                  name = info.filename
+                  rec = (name, n)
+                  is_elf = data[:4] == b'\x7fELF'
+                  if is_elf:
+                      elf_hits.append(rec)
+                  elif name.endswith(('.txt', '.conf', '.cfg', '.ini', '.sh', '.py',
+                                      '.pl', '.rb', '.properties', '.service',
+                                      '.json', '.xml', '.list', '.md')) \
+                          or os.path.basename(name) in ('sh', 'bash', 'dash'):
+                      txt_hits.append(rec)
+                  else:
+                      other_hits.append(rec)
+
+          print()
+          print('=' * 64)
+          print('TOTAL com.termux occurrences : %d' % total)
+          print('ELF files                    : %d' % len(elf_hits))
+          print('TEXT files                   : %d' % len(txt_hits))
+          print('OTHER files                  : %d' % len(other_hits))
+          print('=' * 64)
+
+          def dump(title, items, limit=60):
+              print()
+              print('--- %s (%d) ---' % (title, len(items)))
+              for name, n in items[:limit]:
+                  print('  %6d  %s' % (n, name))
+              if len(items) > limit:
+                  print('  ... and %d more' % (len(items) - limit))
+
+          dump('ELF (binaries, hard to patch)', elf_hits)
+          dump('TEXT (scripts/configs)', txt_hits)
+          dump('OTHER', other_hits[:30])
+
+          ai_total = 0
+          ai_files = 0
+          with zipfile.ZipFile(ZIP) as z:
+              for info in z.infolist():
+                  if info.file_size == 0 or info.file_size > 50_000_000:
+                      continue
+                  try:
+                      with z.open(info) as f:
+                          data = f.read()
+                  except Exception:
+                      continue
+                  c = data.count(b'me.sources.ai')
+                  if c:
+                      ai_total += c
+                      ai_files += 1
+          print()
+          print('me.sources.ai occurrences: %d in %d files' % (ai_total, ai_files))
+          PY
+
+      - name: Write summary
+        if: always()
+        run: |
+          {
+            echo "### Bootstrap residue analysis"
+            echo ""
+            echo "见上一个 step 的完整输出。关键指标："
+            echo "- TOTAL com.termux：残留总数"
+            echo "- ELF：烧进二进制的，最难改"
+            echo "- TEXT：脚本/配置，可直接替换"
+            echo "- me.sources.ai：确认改名生效的文件数"
+          } >> "$GITHUB_STEP_SUMMARY"

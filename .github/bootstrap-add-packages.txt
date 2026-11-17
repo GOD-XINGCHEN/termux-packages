@@ -1,0 +1,158 @@
+# =============================================================================
+# Bootstrap 增包清单
+# =============================================================================
+#
+# 这是**唯一**需要修改的地方。增包 / 删包都只改这个文件，不要动 workflow。
+#
+# 构建模式由 workflow 的 package_mode 决定：
+#   default  纯默认包集，完全忽略本文件
+#   list     读本文件（默认）
+#   custom   用 dispatch 手填的 add_packages，忽略本文件
+#
+# 格式规则：
+#   - 每行一个包名
+#   - # 开头是注释，空行忽略；行尾 # 注释也支持
+#   - 重复项会自动去重
+#
+# ★ 关键约束：--add 只接受**主包目录名**，也就是 packages/ 下真实存在的目录。
+#   命令名 ≠ 包名。几个容易踩的例子（preflight 会直接报错拦住）：
+#     clang / lld / llvm / libcompiler-rt  -> 都属于 libllvm 这一个包
+#     aapt2                                -> 由 aapt 包提供
+#     xxd                                  -> 由 vim 包提供
+#     libltdl                              -> 由 libtool 包提供
+#     libdw / libdebuginfod / elfutils     -> 上游已由 libdwarf 取代
+#     openssh-sftp-server                  -> openssh 的子包
+#
+#   改完清单后可以本地自查：把包名和 allpkgs.txt（git tree 导出的全部主包）比对。
+#
+# 本清单来源：把 Sources-AI-v3 的 bootstrap-aarch64.zip 里的
+# var/lib/dpkg/status 与我们的构建逐包比对，得到 112 个「v3 有、我们没有」的包，
+# 再按上面的主包规则归并。
+#   v3   : 221 packages / 27,820 files / 689 binaries / 539 MB
+#   我们 : 159 packages / 17,481 files / 423 binaries / 122 MB
+# =============================================================================
+
+# ---------- Clang / LLVM 工具链 ----------
+# 注意：下面四个都归到 libllvm 一个包，clang/lld/llvm/libcompiler-rt 是它的子包，
+# 写子包名会被 preflight 判为非法。
+libllvm
+
+# ---------- NDK / 交叉编译 ----------
+ndk-sysroot
+binutils
+libandroid-execinfo
+libandroid-shmem
+libandroid-spawn
+libandroid-stub
+libandroid-sysv-semaphore
+libresolv-wrapper
+
+# ---------- Android 逆向 ----------
+apktool
+apksigner
+aapt
+d8
+dx
+dex2jar
+jadx
+procyon-decompiler
+
+# ---------- 调试 / 二进制分析 ----------
+gdb
+libdwarf
+libelf
+libthread-db
+strace
+ltrace
+radare2
+
+# ---------- 网络 ----------
+aria2
+dnsutils
+ldns
+nmap
+openssh
+dropbear
+rsync
+wget
+socat
+
+# ---------- 构建工具 ----------
+cmake
+ninja
+patchelf
+libtool
+
+# ---------- 运行时 / 语言 ----------
+nodejs-lts
+npm
+openjdk-21
+python-pip
+lua54
+dbus
+dbus-glib
+
+# ---------- Termux 集成 ----------
+termux-api
+termux-auth
+proot
+proot-distro
+tsu
+
+# ---------- 常用 CLI ----------
+busybox
+git
+jq
+htop
+tree
+tmux
+vim
+zsh
+zip
+which
+hexedit
+xmlstarlet
+traceroute
+guile
+rhash
+
+# ---------- 库依赖 ----------
+abseil-cpp
+alsa-lib
+alsa-plugins
+argp
+c-ares
+cmocka
+fmt
+json-c
+jsoncpp
+krb5
+libarchive
+libcap
+libedit
+libflac
+libgc
+libicu
+libjpeg-turbo
+libmicrohttpd
+libmp3lame
+libmpg123
+libogg
+libopus
+libpcap
+libpopt
+libprotobuf
+libsndfile
+libsodium
+libsoxr
+libtalloc
+liburcu
+libuv
+libvorbis
+libwebrtc-audio-processing
+libzopfli
+littlecms
+oniguruma
+speexdsp
+utf8proc
+pulseaudio
