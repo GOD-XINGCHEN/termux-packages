@@ -657,6 +657,68 @@ main() {
 		# mounted repo root and always survives, while markers historically did
 		# not. Rebuilding them here means a run that only preserved output/ still
 		# does not recompile everything.
+		# Unpack every cached deb into the live sysroot.
+		#
+		# A deb restored to output/ does nothing for the compiler: configure probes read
+		# $TERMUX_PREFIX, not the deb directory. Without this step a resumed build runs
+		# against an empty prefix and fails feature probes that a from-scratch build
+		# passes. libmp3lame hit exactly that -- HAVE_LANGINFO_H (provided by
+		# libandroid-support) probed false, so its <locale.h> include was compiled out
+		# and setlocale() was reported undeclared.
+		#
+		# Extraction matches termux_step_get_dependencies: ar to pull the data member,
+		# tar to unpack at /. GNU tar sniffs the compression, so xz/gz/bz2 need no case
+		# statement. --no-overwrite-dir preserves existing directory permissions instead
+		# of taking the archive's, which would clobber a prefix that is in use.
+		install_cached_debs() {
+			local deb data_archive
+			local installed=0 failed=0
+			local current_pkg cached_pkg
+
+			[ -d "$TERMUX_BUILT_DEBS_DIRECTORY" ] || return 0
+			compgen -G "$TERMUX_BUILT_DEBS_DIRECTORY/*.deb" > /dev/null 2>&1 || return 0
+
+			# Never install debs built for a different app package name: they carry the
+			# other prefix in their paths and would scatter a second tree under
+			# /data/data, leaving the prefix half-populated -- worse than empty.
+			current_pkg="${TERMUX_APP__PACKAGE_NAME:-unknown}"
+			cached_pkg=""
+			[ -f "$TERMUX_CACHE_STAMP_FILE" ] && cached_pkg="$(tr -d '[:space:]' < "$TERMUX_CACHE_STAMP_FILE" 2>/dev/null)"
+			if [ -z "$cached_pkg" ]; then
+				echo "[!] cached debs carry no package-name stamp; not installing them" 1>&2
+				return 0
+			fi
+			if [ "$cached_pkg" != "$current_pkg" ]; then
+				echo "[!] cached debs are for '$cached_pkg' but this build is '$current_pkg'; not installing" 1>&2
+				return 0
+			fi
+
+			echo "[*] Installing cached debs into the sysroot..."
+			for deb in "$TERMUX_BUILT_DEBS_DIRECTORY"/*.deb; do
+				[ -e "$deb" ] || continue
+				data_archive=""
+				for cand in data.tar.xz data.tar.gz data.tar.bz2 data.tar; do
+					if ar p "$deb" "$cand" > /dev/null 2>&1; then
+						data_archive="$cand"
+						break
+					fi
+				done
+				if [ -z "$data_archive" ]; then
+					failed=$((failed + 1))
+					echo "[!] no data member in $(basename "$deb")" 1>&2
+					continue
+				fi
+				if ar p "$deb" "$data_archive" 2>/dev/null | tar x --no-overwrite-dir -C / 2>/dev/null; then
+					installed=$((installed + 1))
+				else
+					failed=$((failed + 1))
+					echo "[!] could not unpack $(basename "$deb")" 1>&2
+				fi
+			done
+			echo "[*] installed $installed deb(s) into the sysroot, $failed failed"
+			return 0
+		}
+
 		adopt_debs_as_markers() {
 			local deb name version
 			local adopted=0
@@ -945,34 +1007,50 @@ main() {
 				fi
 			done
 
-			echo "[*] Audio cycle pre-stage: libmpg123 (no depcheck) -> libmp3lame -> pulseaudio"
+			local need_mpg123=1 need_lame=1 need_pulse=1
+			if [ -f "$TERMUX_BUILT_PACKAGES_DIRECTORY/libmpg123" ]; then need_mpg123=0; fi
+			if [ -f "$TERMUX_BUILT_PACKAGES_DIRECTORY/libmp3lame" ]; then need_lame=0; fi
+			if [ -f "$TERMUX_BUILT_PACKAGES_DIRECTORY/pulseaudio" ]; then need_pulse=0; fi
+
+			if [ "$need_mpg123" -eq 0 ] && [ "$need_lame" -eq 0 ] && [ "$need_pulse" -eq 0 ]; then
+				echo "[*] Audio cycle pre-stage skipped: all three already marked built"
+				return 0
+			fi
+
+			echo "[*] Audio cycle pre-stage: need mpg123=$need_mpg123 lame=$need_lame pulse=$need_pulse"
 
 			# 1. libmpg123 without dependency resolution.
 			#    -s sets TERMUX_SKIP_DEPCHECK, which makes termux_step_get_dependencies
 			#    return immediately, so pulseaudio is not pulled in recursively.
-			BUILD_PACKAGE_OPTIONS+=("-s")
-			build_package "$arch" "libmpg123"
-			rc=$?
-			BUILD_PACKAGE_OPTIONS=("${saved_options[@]}")
-			if [ "$rc" -ne 0 ]; then
-				echo "[!] audio cycle pre-stage: libmpg123 failed ($rc)" 1>&2
-				return "$rc"
+			if [ "$need_mpg123" -eq 1 ]; then
+				BUILD_PACKAGE_OPTIONS+=("-s")
+				build_package "$arch" "libmpg123"
+				rc=$?
+				BUILD_PACKAGE_OPTIONS=("${saved_options[@]}")
+				if [ "$rc" -ne 0 ]; then
+					echo "[!] audio cycle pre-stage: libmpg123 failed ($rc)" 1>&2
+					return "$rc"
+				fi
 			fi
 
 			# 2. libmp3lame now that libmpg123.pc exists.
-			build_package "$arch" "libmp3lame"
-			rc=$?
-			if [ "$rc" -ne 0 ]; then
-				echo "[!] audio cycle pre-stage: libmp3lame failed ($rc)" 1>&2
-				return "$rc"
+			if [ "$need_lame" -eq 1 ]; then
+				build_package "$arch" "libmp3lame"
+				rc=$?
+				if [ "$rc" -ne 0 ]; then
+					echo "[!] audio cycle pre-stage: libmp3lame failed ($rc)" 1>&2
+					return "$rc"
+				fi
 			fi
 
 			# 3. pulseaudio now that the whole libsndfile chain below it is built.
-			build_package "$arch" "pulseaudio"
-			rc=$?
-			if [ "$rc" -ne 0 ]; then
-				echo "[!] audio cycle pre-stage: pulseaudio failed ($rc)" 1>&2
-				return "$rc"
+			if [ "$need_pulse" -eq 1 ]; then
+				build_package "$arch" "pulseaudio"
+				rc=$?
+				if [ "$rc" -ne 0 ]; then
+					echo "[!] audio cycle pre-stage: pulseaudio failed ($rc)" 1>&2
+					return "$rc"
+				fi
 			fi
 
 			# Persist what the pre-stage built. Without this, a cancellation
@@ -983,19 +1061,26 @@ main() {
 				cp -a "$TERMUX_BUILT_PACKAGES_DIRECTORY"/. "$TERMUX_BUILT_PACKAGES_MIRROR"/ 2>/dev/null || true
 			fi
 
-			# Drop libmpg123's "already built" marker so the main loop rebuilds
-			# it. Step 1 built it with no libpulse in the sysroot, so its pulse
-			# output module was skipped. Now that pulseaudio is installed the
-			# rebuild compiles that module in; without this the archive would ship
-			# without pulse support even though nothing was explicitly disabled.
-			if [ -d "$TERMUX_BUILT_PACKAGES_DIRECTORY" ]; then
+			# If step 1 built libmpg123 without libpulse in the sysroot, its pulse
+			# output module was skipped. Drop the marker so the main loop rebuilds
+			# it now that pulseaudio is installed. When libmpg123 came from cache it
+			# was built with pulse already, so rebuilding would only risk a failure
+			# for no gain.
+			if [ "$need_mpg123" -eq 1 ] && [ -d "$TERMUX_BUILT_PACKAGES_DIRECTORY" ]; then
 				rm -f -- "$TERMUX_BUILT_PACKAGES_DIRECTORY/libmpg123"
-				echo "[*] cleared libmpg123 build marker so the main loop rebuilds it with pulse"
+				echo "[*] cleared libmpg123 marker so the main loop rebuilds it with pulse"
 			fi
 
 			echo "[*] Audio cycle pre-stage done; main loop will rebuild libmpg123 with pulse support"
 			return 0
 		}
+
+		# Make the sysroot match what the cache says has been built.
+		# Must run before anything compiles: configure probes read the live
+		# prefix, so an un-unpacked cache is indistinguishable from an empty one.
+		if [[ "$TERMUX_KEEP_BUILT_PACKAGES" == "1" ]]; then
+			install_cached_debs
+		fi
 
 		bootstrap_prestage_audio_cycle "$TERMUX_ARCH" || return $?
 
