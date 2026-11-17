@@ -4,7 +4,7 @@ TERMUX_PKG_LICENSE="Apache-2.0"
 TERMUX_PKG_MAINTAINER="@termux"
 TERMUX_PKG_VERSION="3.10.1"
 _JLINE_VERSION=4.4.5
-TERMUX_PKG_SRCURL=(https://archive.apache.org/dist/maven/maven-3/${TERMUX_PKG_VERSION}/binaries/apache-maven-${TERMUX_PKG_VERSION}-bin.tar.gz
+TERMUX_PKG_SRCURL=(https://dlcdn.apache.org/maven/maven-3/${TERMUX_PKG_VERSION}/binaries/apache-maven-${TERMUX_PKG_VERSION}-bin.tar.gz
                    https://github.com/jline/jline3/archive/refs/tags/${_JLINE_VERSION}.tar.gz)
 TERMUX_PKG_SHA256=(
 	810b8348f0a40f9116c202093fae007ebeabf67699bf34d81ee7e272289e085a

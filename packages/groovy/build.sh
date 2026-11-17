@@ -4,7 +4,7 @@ TERMUX_PKG_LICENSE="Apache-2.0"
 TERMUX_PKG_MAINTAINER="@termux"
 TERMUX_PKG_VERSION="6.0.0"
 _JLINE_VERSION=4.4.5
-TERMUX_PKG_SRCURL=(https://archive.apache.org/dist/groovy/$TERMUX_PKG_VERSION/distribution/apache-groovy-binary-$TERMUX_PKG_VERSION.zip
+TERMUX_PKG_SRCURL=(https://downloads.apache.org/groovy/$TERMUX_PKG_VERSION/distribution/apache-groovy-binary-$TERMUX_PKG_VERSION.zip
                    https://github.com/jline/jline3/archive/refs/tags/${_JLINE_VERSION}.tar.gz)
 TERMUX_PKG_SHA256=(54ab1a877f01da2ed16ed43c1ed7a8d6c36b122714c6959712700e89e6efde7c
                    6576c19db0c5d3a5b5e20daf7c4412dff5ff9ff1fcb788361840c618b09b2b31)
