@@ -726,12 +726,12 @@ main() {
 					data.tar.bz2)  decompress_flag="-j" ;;
 					*)             decompress_flag="" ;;
 				esac
-				# Capture tar's status immediately. Testing $? after a case statement
-				# would read the case's own status, which is 0 whenever a branch matched --
-				# exactly the kind of silent success that hid the previous failure.
-				tar x${decompress_flag}f "$workdir/data.tar" -C / > /dev/null 2>"$workdir/err"
-				local tar_rc=$?
-				if [ "$tar_rc" -eq 0 ]; then
+				# tar must run as an if-condition, not as a bare command.
+				# The script runs with set -e, so a bare failing command aborts the whole
+				# build before the next line can read $?. tar exits 2 on fatal errors, which
+				# is exactly the BUILD_EXIT_CODE=2 seen in the log, with the failure branch
+				# unreachable and no error text. Inside an if condition set -e stands down.
+				if tar x${decompress_flag}f "$workdir/data.tar" -C / > /dev/null 2>"$workdir/err"; then
 					installed=$((installed + 1))
 				else
 					failed=$((failed + 1))
@@ -1108,7 +1108,13 @@ main() {
 		# Must run before anything compiles: configure probes read the live
 		# prefix, so an un-unpacked cache is indistinguishable from an empty one.
 		if [[ "$TERMUX_KEEP_BUILT_PACKAGES" == "1" ]]; then
+			# Best-effort sysroot population. A failure here degrades the build
+			# (some packages may recompile) but must never abort it: the counters
+			inside the function already report what went wrong, and set +e keeps a
+			# stray non-zero from tripping the caller's set -e.
+			set +e
 			install_cached_debs
+			set -e
 		fi
 
 		bootstrap_prestage_audio_cycle "$TERMUX_ARCH" || return $?
