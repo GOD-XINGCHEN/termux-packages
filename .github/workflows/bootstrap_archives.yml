@@ -30,6 +30,15 @@ name: Bootstrap archives (custom package name, from source)
 on:
   workflow_dispatch:
     inputs:
+      flavor:
+        description: "构建哪个 flavor。debug/perf 包名不同、缓存不能共用，同时跑会把 6 小时额度撕成两半"
+        required: false
+        type: choice
+        options:
+          - debug
+          - perf
+          - both
+        default: debug
       architectures:
         description: "目标架构，逗号分隔（aarch64,arm,i686,x86_64）"
         required: false
@@ -97,16 +106,31 @@ jobs:
         id: matrix
         env:
           ARCHITECTURES: ${{ inputs.architectures || 'aarch64' }}
+          FLAVOR_INPUT: ${{ inputs.flavor || 'debug' }}
         run: |
           set -euo pipefail
 
           # ---- 包名定义（与 app/build.gradle.kts 对齐）-----------------------
           #   debug buildType : applicationId = me.sources.ai + ".debug"
           #   perf  buildType : applicationId = me.sources.ai
-          flavors='[
+          # Full definitions; the selector below keeps only what was asked for.
+          # Both entries stay here so package names remain in one place, and the
+          # matrix jobs keep their existing names and cache keys.
+          all_flavors='[
             {"id":"debug","package_name":"me.sources.ai.debug"},
             {"id":"perf", "package_name":"me.sources.ai"}
           ]'
+          FLAVOR_PICK="${FLAVOR_INPUT:-debug}"
+          case "$FLAVOR_PICK" in
+            debug) flavors="$(printf '%s' "$all_flavors" | jq -c '[.[] | select(.id=="debug")]')" ;;
+            perf)  flavors="$(printf '%s' "$all_flavors" | jq -c '[.[] | select(.id=="perf")]')" ;;
+            both)  flavors="$all_flavors" ;;
+            *)
+              echo "::error::flavor 输入只能是 debug / perf / both，收到 '$FLAVOR_PICK'"
+              exit 1
+              ;;
+          esac
+          echo "flavor selector = $FLAVOR_PICK"
           # ------------------------------------------------------------------
 
           archs="$(printf '%s' "$ARCHITECTURES" | tr -d ' ' | tr ',' '\n' | jq -R . | jq -s -c .)"
